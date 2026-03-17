@@ -47,6 +47,28 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
 
   const showLowerPanel = indicators.cvd;
 
+  const refreshVolumeProfileForVisibleRange = async () => {
+    const chart = chartRef.current;
+    if (!chart || !indicators.volumeProfile) return;
+
+    const range = chart.timeScale().getVisibleRange();
+    if (!range?.from || !range?.to) return;
+
+    const response = await fetch(`/api/indicators/volume-profile?timeframe=${timeframe}&from=${Math.floor(range.from)}&to=${Math.ceil(range.to)}`);
+    const payload = await response.json();
+
+    if (import.meta.env.DEV) {
+      console.debug('[volume-profile]', {
+        timeframe,
+        from: Math.floor(range.from),
+        to: Math.ceil(range.to),
+        buckets: (payload.profile || []).length
+      });
+    }
+
+    setProfile(payload.profile || []);
+  };
+
   const compactLabel = useMemo(() => {
     const enabled = Object.entries(indicators).filter(([, value]) => value).map(([key]) => key);
     return enabled.length ? `Indicators (${enabled.length})` : 'Indicators';
@@ -215,6 +237,7 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
       snapshotRefreshTimerRef.current = window.setTimeout(() => {
         snapshotRefreshTimerRef.current = null;
         refreshSessionSnapshot();
+        refreshVolumeProfileForVisibleRange();
       }, 250);
     };
 
@@ -223,7 +246,7 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
       chartSocket.off('trade', onTrade);
       if (snapshotRefreshTimerRef.current) window.clearTimeout(snapshotRefreshTimerRef.current);
     };
-  }, [timeframe, indicators.vwap, indicators.cvd]);
+  }, [timeframe, indicators.vwap, indicators.cvd, indicators.volumeProfile]);
 
   useEffect(() => {
     drawVolumeProfile();
@@ -235,20 +258,8 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
 
     const onRangeChange = () => {
       if (visibleRangeTimerRef.current) window.clearTimeout(visibleRangeTimerRef.current);
-      visibleRangeTimerRef.current = window.setTimeout(async () => {
-        const range = chart.timeScale().getVisibleRange();
-        if (!range?.from || !range?.to) return;
-        const response = await fetch(`/api/indicators/volume-profile?timeframe=${timeframe}&from=${Math.floor(range.from)}&to=${Math.ceil(range.to)}`);
-        const payload = await response.json();
-        if (import.meta.env.DEV) {
-          console.debug('[volume-profile]', {
-            timeframe,
-            from: Math.floor(range.from),
-            to: Math.ceil(range.to),
-            buckets: (payload.profile || []).length
-          });
-        }
-        setProfile(payload.profile || []);
+      visibleRangeTimerRef.current = window.setTimeout(() => {
+        refreshVolumeProfileForVisibleRange();
       }, 250);
     };
 

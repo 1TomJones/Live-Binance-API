@@ -296,7 +296,7 @@ export function buildVolumeProfileByDollar(trades) {
 
   const buckets = new Map();
   trades.forEach((trade) => {
-    const bucket = Math.floor(Number(trade.price));
+    const bucket = Math.round(Number(trade.price));
     const volume = Number(trade.quantity || 0);
     buckets.set(bucket, (buckets.get(bucket) || 0) + volume);
   });
