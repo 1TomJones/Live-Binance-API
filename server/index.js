@@ -44,7 +44,12 @@ import {
 
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'BTCUSDT';
-const BINANCE_REST = 'https://api.binance.com/api/v3';
+const BINANCE_REST_BASES = [
+  process.env.BINANCE_REST_URL,
+  'https://api.binance.com/api/v3',
+  'https://api1.binance.com/api/v3',
+  'https://data-api.binance.vision/api/v3'
+].filter(Boolean);
 
 const app = express();
 const server = http.createServer(app);
@@ -87,9 +92,35 @@ async function backfillCurrentSessionFromBinance(dayStartMs, nowMs) {
   let cursor = dayStartMs;
 
   while (cursor <= nowMs) {
-    const url = `${BINANCE_REST}/aggTrades?symbol=${SYMBOL}&startTime=${cursor}&endTime=${nowMs}&limit=1000`;
-    const response = await fetch(url);
-    if (!response.ok) break;
+    const search = new URLSearchParams({
+      symbol: SYMBOL,
+      startTime: String(cursor),
+      endTime: String(nowMs),
+      limit: '1000'
+    });
+
+    let response = null;
+    let lastError = null;
+
+    for (const baseUrl of BINANCE_REST_BASES) {
+      const url = `${baseUrl}/aggTrades?${search.toString()}`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+
+      try {
+        response = await fetch(url, { signal: controller.signal });
+        if (response.ok) break;
+        lastError = new Error(`HTTP ${response.status} from ${baseUrl}`);
+      } catch (error) {
+        lastError = error;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    if (!response?.ok) {
+      throw new Error(`Unable to backfill aggTrades from Binance endpoints: ${lastError?.message || 'unknown error'}`);
+    }
 
     const batch = await response.json();
     if (!batch.length) break;
@@ -129,6 +160,23 @@ async function initializeCurrentSession() {
     trades: sortedUnique,
     tradeIds: new Set(sortedUnique.map((trade) => trade.trade_id))
   };
+}
+
+async function initializeCurrentSessionWithRetries() {
+  let attempt = 0;
+
+  while (true) {
+    attempt += 1;
+    try {
+      await initializeCurrentSession();
+      console.log(`Current session initialized (attempt ${attempt}).`);
+      return;
+    } catch (error) {
+      const retryDelayMs = Math.min(30000, 1000 * 2 ** Math.min(attempt - 1, 5));
+      console.error(`Session initialization failed (attempt ${attempt}). Retrying in ${retryDelayMs}ms.`, error);
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+    }
+  }
 }
 
 function buildSessionPayload(timeframe = '1m') {
@@ -238,8 +286,14 @@ const stream = new BinanceStreamService({
   }
 });
 
-await initializeCurrentSession();
+server.listen(PORT, () => {
+  console.log(`Kent Invest Crypto Tape Terminal listening on ${PORT}`);
+});
+
 stream.start();
+initializeCurrentSessionWithRetries().catch((error) => {
+  console.error('Unexpected fatal error while initializing current session.', error);
+});
 
 io.on('connection', (socket) => {
   const recent = getRecentTrades(SYMBOL, 500).reverse();
@@ -399,8 +453,4 @@ const clientDist = path.resolve(__dirname, '../client/dist');
 app.use(express.static(clientDist));
 app.get('*', (_req, res) => {
   res.sendFile(path.join(clientDist, 'index.html'));
-});
-
-server.listen(PORT, () => {
-  console.log(`Kent Invest Crypto Tape Terminal listening on ${PORT}`);
 });
