@@ -228,6 +228,69 @@ export function computeSessionCvdFromTrades(trades, timeframe = '1m', { sessionS
   return result;
 }
 
+export function computeSessionCvdFromMinuteCandles(minuteCandles = [], timeframe = '1m', { sessionStartMs, nowMs = Date.now() } = {}) {
+  const resolvedSessionStartMs = sessionStartMs ?? getUtcDayStartMs(nowMs);
+  const startSec = bucketTime(Math.floor(resolvedSessionStartMs / 1000), timeframe);
+  const endSec = bucketTime(Math.floor(nowMs / 1000), timeframe);
+  const tfSec = timeframeToSeconds(timeframe);
+
+  if (timeframe === '1m') {
+    const minuteMap = new Map(minuteCandles.map((candle) => [candle.time, candle]));
+    const result = [];
+    let previousClose = 0;
+
+    for (let ts = startSec; ts <= endSec; ts += tfSec) {
+      const existing = minuteMap.get(ts);
+      if (existing) {
+        previousClose = existing.close;
+        result.push({ ...existing });
+      } else {
+        result.push({ time: ts, open: previousClose, high: previousClose, low: previousClose, close: previousClose, hasTrades: false });
+      }
+    }
+
+    return result;
+  }
+
+  const minuteSeries = computeSessionCvdFromMinuteCandles(minuteCandles, '1m', { sessionStartMs: resolvedSessionStartMs, nowMs });
+  const buckets = new Map();
+
+  minuteSeries.forEach((candle) => {
+    const bucket = bucketTime(candle.time, timeframe);
+    const existing = buckets.get(bucket);
+    if (!existing) {
+      buckets.set(bucket, {
+        time: bucket,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        hasTrades: Boolean(candle.hasTrades)
+      });
+      return;
+    }
+
+    existing.high = Math.max(existing.high, candle.high);
+    existing.low = Math.min(existing.low, candle.low);
+    existing.close = candle.close;
+    existing.hasTrades = existing.hasTrades || Boolean(candle.hasTrades);
+  });
+
+  const result = [];
+  let previousClose = 0;
+  for (let ts = startSec; ts <= endSec; ts += tfSec) {
+    const existing = buckets.get(ts);
+    if (existing) {
+      previousClose = existing.close;
+      result.push(existing);
+    } else {
+      result.push({ time: ts, open: previousClose, high: previousClose, low: previousClose, close: previousClose, hasTrades: false });
+    }
+  }
+
+  return result;
+}
+
 export function buildVolumeProfileByDollar(trades) {
   if (!trades.length) return [];
 
@@ -239,6 +302,19 @@ export function buildVolumeProfileByDollar(trades) {
   });
 
   const sorted = [...buckets.entries()].sort((a, b) => a[0] - b[0]);
+  const maxVolume = Math.max(...sorted.map(([, volume]) => volume), 1);
+
+  return sorted.map(([price, volume]) => ({
+    price,
+    volume,
+    ratio: volume / maxVolume
+  }));
+}
+
+export function buildVolumeProfileFromMap(volumeMap = new Map()) {
+  if (!volumeMap.size) return [];
+
+  const sorted = [...volumeMap.entries()].sort((a, b) => a[0] - b[0]);
   const maxVolume = Math.max(...sorted.map(([, volume]) => volume), 1);
 
   return sorted.map(([price, volume]) => ({
