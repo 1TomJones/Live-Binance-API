@@ -6,13 +6,26 @@ import { fileURLToPath } from 'url';
 import { Server } from 'socket.io';
 import { BinanceStreamService } from './binanceStream.js';
 import {
+  completeQuantBacktestJob,
+  createQuantBacktestJob,
+  failQuantBacktestJob,
   getLatestBook,
+  getQuantBacktestJobById,
+  getQuantResultByJobId,
   getRecentTrades,
   getTradeRange,
   getTradesByRange,
+  listQuantBacktestJobs,
+  listQuantJobProgress,
   saveBookTicker,
-  saveTrade
+  saveQuantBacktestResult,
+  saveQuantStrategy,
+  saveTrade,
+  updateQuantBacktestJob
 } from './db.js';
+import { BacktestJobService, StrategyExecutionService } from './quant/backtestJobService.js';
+import { LiveStrategyRunner } from './quant/liveMetricsStore.js';
+import { StrategyParserService, StrategyUploadService, StrategyValidationService } from './quant/strategyServices.js';
 
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'BTCUSDT';
@@ -28,12 +41,31 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
 let latestTrade = null;
 let latestBook = null;
 let latestDepth = null;
 let candles = [];
+
+const strategyUploadService = new StrategyUploadService({
+  validationService: new StrategyValidationService(),
+  parserService: new StrategyParserService(),
+  saveStrategyRecord: saveQuantStrategy
+});
+
+const backtestJobService = new BacktestJobService({
+  executionService: new StrategyExecutionService(),
+  createJob: createQuantBacktestJob,
+  updateJob: updateQuantBacktestJob,
+  completeJob: completeQuantBacktestJob,
+  failJob: failQuantBacktestJob,
+  saveResult: saveQuantBacktestResult,
+  listJobProgress: listQuantJobProgress,
+  getJobById: getQuantBacktestJobById
+});
+
+const liveStrategyRunner = new LiveStrategyRunner();
 
 function aggregateCandles(sourceCandles, timeframe = '1m') {
   const bucketSeconds = TIMEFRAME_TO_SECONDS[timeframe] || TIMEFRAME_TO_SECONDS['1m'];
@@ -151,6 +183,57 @@ io.on('connection', (socket) => {
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, symbol: SYMBOL });
+});
+
+app.post('/api/quant/strategy/upload', (req, res) => {
+  const { fileName, content } = req.body || {};
+  const result = strategyUploadService.handleUpload({ fileName, content });
+  if (result.status === 'invalid') {
+    return res.status(400).json(result);
+  }
+  return res.json(result);
+});
+
+app.post('/api/quant/backtests', (req, res) => {
+  const { strategyId, runConfig } = req.body || {};
+  if (!strategyId || !runConfig) {
+    return res.status(400).json({ error: 'strategyId and runConfig are required.' });
+  }
+
+  const job = backtestJobService.start({ strategyId, runConfig });
+  return res.status(202).json({ jobId: job.id, job });
+});
+
+app.post('/api/quant/backtests/:jobId/cancel', (req, res) => {
+  backtestJobService.cancel(Number(req.params.jobId));
+  return res.json({ ok: true });
+});
+
+app.get('/api/quant/backtests/:jobId', (req, res) => {
+  const jobId = Number(req.params.jobId);
+  const job = getQuantBacktestJobById(jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  const progress = backtestJobService.getProgress(jobId);
+  const result = getQuantResultByJobId(jobId);
+  return res.json({ job, progress, result });
+});
+
+app.get('/api/quant/runs', (_req, res) => {
+  const jobs = listQuantBacktestJobs(100).map((job) => ({
+    ...job,
+    summary: job.result_id ? JSON.parse(getQuantResultByJobId(job.id)?.summary_json || '{}') : null,
+    strategyMetadata: job.metadata_json ? JSON.parse(job.metadata_json) : null
+  }));
+  return res.json({ runs: jobs });
+});
+
+app.get('/api/quant/live-metrics', (_req, res) => {
+  return res.json({ metrics: liveStrategyRunner.getSnapshot() });
+});
+
+app.post('/api/quant/live-metrics', (req, res) => {
+  return res.json({ metrics: liveStrategyRunner.update(req.body || {}) });
 });
 
 app.get('/api/candles', (req, res) => {

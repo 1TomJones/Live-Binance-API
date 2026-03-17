@@ -235,3 +235,43 @@ body { margin: 0; background: #060b13; }
   .book-panel { max-height: 33vh; }
   .tape-panel { max-height: 36vh; }
 }
+
+.quant-root {
+  min-height: 100vh;
+  background: linear-gradient(180deg, #0a111d 0%, #070c15 100%);
+  color: #d4dceb;
+  padding: 12px;
+}
+.quant-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 12px; border-bottom: 1px solid #1a263d; padding-bottom: 10px; }
+.quant-header h1 { margin: 0; font-size: 18px; letter-spacing: .03em; }
+.quant-header span { color: #8ca5d0; font-size: 12px; }
+.quant-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.quant-panel { border: 1px solid #1a263d; background: #0b1220; padding: 10px; min-height: 130px; }
+.quant-panel h3 { margin: 0 0 8px; font-size: 12px; color: #9ab0d7; text-transform: uppercase; letter-spacing: .04em; }
+.quant-dropzone { border: 1px dashed #2b4267; background: #0a1529; padding: 16px; text-align: center; cursor: pointer; }
+.quant-dropzone p { margin: 0; }
+.quant-dropzone small { color: #7f95bb; }
+.quant-upload-row { display: flex; justify-content: space-between; margin-top: 8px; font-size: 12px; gap: 8px; align-items: center; }
+.quant-upload-row button, .quant-panel button { background: #11203a; color: #a9bee4; border: 1px solid #2b4267; padding: 4px 8px; cursor: pointer; }
+.quant-error { color: #f28c96; font-size: 12px; }
+.quant-empty { color: #7890b8; font-size: 12px; }
+.quant-note { color: #91add9; font-size: 12px; margin-top: 8px; }
+.quant-summary-grid, .quant-metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+.quant-summary-grid label, .quant-metric-grid label { color: #7f95bb; display: block; font-size: 11px; text-transform: uppercase; }
+.quant-summary-grid span, .quant-metric-grid strong { font-size: 12px; color: #d8e3f8; }
+.quant-form-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 8px; margin-bottom: 8px; }
+.quant-form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: #7f95bb; }
+.quant-form-grid input, .quant-form-grid select { background: #091223; border: 1px solid #22365a; color: #d4dceb; padding: 5px; }
+.quant-progress { width: 100%; height: 8px; background: #091223; border: 1px solid #22365a; }
+.quant-progress > div { height: 100%; background: linear-gradient(90deg,#3f8cff,#59d8b4); }
+.quant-chart { width: 100%; height: 180px; border: 1px solid #22365a; background: #091223; }
+.quant-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.quant-table th, .quant-table td { border-bottom: 1px solid #1a263d; padding: 6px; text-align: left; }
+.quant-table tr:hover { background: #111d33; cursor: pointer; }
+.quant-span-2 { grid-column: span 2; }
+
+@media (max-width: 1180px) {
+  .quant-grid { grid-template-columns: 1fr; }
+  .quant-span-2 { grid-column: span 1; }
+  .quant-form-grid, .quant-summary-grid, .quant-metric-grid { grid-template-columns: 1fr; }
+}
