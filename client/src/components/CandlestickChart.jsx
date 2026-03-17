@@ -84,7 +84,10 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
     const response = await fetch(`/api/session/snapshot?timeframe=${timeframe}`);
     const payload = await response.json();
 
-    const candles = (payload.candles || []).map(({ time, open, high, low, close }) => ({ time, open, high, low, close }));
+    const candles = (payload.candles || []).map(({ time, open, high, low, close, isPlaceholder }) => {
+      if (isPlaceholder || !Number.isFinite(open) || !Number.isFinite(close)) return { time };
+      return { time, open, high, low, close };
+    });
     candleSeriesRef.current?.setData(candles);
 
     if (indicators.vwap) {
@@ -101,6 +104,10 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
       console.debug('[session/snapshot]', {
         timeframe,
         candles: payload.debug.sessionCandleCount,
+        hydrated: payload.debug.hydratedCandleCount,
+        placeholders: payload.debug.placeholderCandleCount,
+        realOhlcVariance: payload.debug.realOhlcVariance,
+        hydrationStatus: payload.debug.hydration?.status,
         counts: payload.debug.timeframeCounts,
         sessionStartIso: payload.sessionStartIso,
         vwapHasVariance: payload.debug.vwapHasVariance,

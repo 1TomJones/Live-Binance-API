@@ -61,17 +61,72 @@ app.use(express.json({ limit: '2mb' }));
 let latestTrade = null;
 let latestBook = null;
 let latestDepth = null;
-let sessionState = {
-  dayStartMs: getUtcDayStartMs(),
-  trades: [],
-  tradeIds: new Set()
-};
+function createSessionState(dayStartMs) {
+  return {
+    dayStartMs,
+    trades: [],
+    tradeIds: new Set(),
+    hydration: {
+      status: 'idle',
+      source: null,
+      startedAt: null,
+      finishedAt: null,
+      fetchedTradeCount: 0,
+      mergedTradeCount: 0,
+      lastError: null
+    }
+  };
+}
+
+let sessionState = createSessionState(getUtcDayStartMs());
 
 function ensureCurrentSession(nowMs = Date.now()) {
   const currentDayStart = getUtcDayStartMs(nowMs);
   if (sessionState.dayStartMs !== currentDayStart) {
-    sessionState = { dayStartMs: currentDayStart, trades: [], tradeIds: new Set() };
+    sessionState = createSessionState(currentDayStart);
+    console.info('[session] rolled to new UTC day', { dayStartIso: new Date(currentDayStart).toISOString() });
   }
+}
+
+function insertTradeIntoSession(trade) {
+  if (!trade || trade.trade_time < sessionState.dayStartMs || sessionState.tradeIds.has(trade.trade_id)) return false;
+  sessionState.tradeIds.add(trade.trade_id);
+  const lastTrade = sessionState.trades.at(-1);
+  if (!lastTrade || trade.trade_time > lastTrade.trade_time || (trade.trade_time === lastTrade.trade_time && trade.trade_id > lastTrade.trade_id)) {
+    sessionState.trades.push(trade);
+  } else {
+    sessionState.trades.push(trade);
+    sessionState.trades.sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
+  }
+  return true;
+}
+
+function mergeTradesIntoSession(trades = []) {
+  let merged = 0;
+  trades.forEach((trade) => {
+    if (insertTradeIntoSession(trade)) merged += 1;
+  });
+  return merged;
+}
+
+function buildTimeScaffold(timeframe, sessionStartMs, nowMs) {
+  const tfSeconds = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600 }[timeframe] || 60;
+  const startSec = Math.floor(sessionStartMs / 1000 / tfSeconds) * tfSeconds;
+  const endSec = Math.floor(nowMs / 1000 / tfSeconds) * tfSeconds;
+  const scaffold = [];
+  for (let ts = startSec; ts <= endSec; ts += tfSeconds) {
+    scaffold.push({
+      time: ts,
+      open: null,
+      high: null,
+      low: null,
+      close: null,
+      volume: 0,
+      hasTrades: false,
+      isPlaceholder: true
+    });
+  }
+  return scaffold;
 }
 
 function normalizeAggTrade(trade) {
@@ -140,26 +195,48 @@ async function backfillCurrentSessionFromBinance(dayStartMs, nowMs) {
 async function initializeCurrentSession() {
   const nowMs = Date.now();
   const dayStartMs = getUtcDayStartMs(nowMs);
+  ensureCurrentSession(nowMs);
+
+  sessionState.hydration = {
+    ...sessionState.hydration,
+    status: 'running',
+    source: 'db+binance-aggTrades',
+    startedAt: Date.now(),
+    finishedAt: null,
+    lastError: null
+  };
 
   const dbTrades = getTradesByRange(SYMBOL, dayStartMs, nowMs, null);
-  let sessionTrades = dbTrades;
+  let fetchedTrades = [...dbTrades];
 
   const presentCount = getTradesCountByRange(SYMBOL, dayStartMs, nowMs);
   if (presentCount < 5000) {
     const backfilled = await backfillCurrentSessionFromBinance(dayStartMs, nowMs);
     saveTradesBatch(backfilled);
-    sessionTrades = [...dbTrades, ...backfilled];
+    fetchedTrades = [...fetchedTrades, ...backfilled];
   }
 
-  const sortedUnique = [...sessionTrades]
+  const sortedUnique = [...fetchedTrades]
     .sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id)
     .filter((trade, index, arr) => index === 0 || trade.trade_id !== arr[index - 1].trade_id);
 
-  sessionState = {
-    dayStartMs,
-    trades: sortedUnique,
-    tradeIds: new Set(sortedUnique.map((trade) => trade.trade_id))
+  const mergedTradeCount = mergeTradesIntoSession(sortedUnique);
+
+  sessionState.hydration = {
+    ...sessionState.hydration,
+    status: 'complete',
+    finishedAt: Date.now(),
+    fetchedTradeCount: sortedUnique.length,
+    mergedTradeCount,
+    lastError: null
   };
+
+  console.info('[session/hydration] complete', {
+    dayStartIso: new Date(dayStartMs).toISOString(),
+    fetchedTradeCount: sortedUnique.length,
+    mergedTradeCount,
+    inMemoryTradeCount: sessionState.trades.length
+  });
 }
 
 async function initializeCurrentSessionWithRetries() {
@@ -172,6 +249,12 @@ async function initializeCurrentSessionWithRetries() {
       console.log(`Current session initialized (attempt ${attempt}).`);
       return;
     } catch (error) {
+      sessionState.hydration = {
+        ...sessionState.hydration,
+        status: 'failed',
+        finishedAt: Date.now(),
+        lastError: error?.message || String(error)
+      };
       const retryDelayMs = Math.min(30000, 1000 * 2 ** Math.min(attempt - 1, 5));
       console.error(`Session initialization failed (attempt ${attempt}). Retrying in ${retryDelayMs}ms.`, error);
       await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
@@ -184,9 +267,15 @@ function buildSessionPayload(timeframe = '1m') {
   const nowMs = Date.now();
   const minuteCandles = buildCanonicalMinuteCandles(sessionState.trades, {
     sessionStartMs: sessionState.dayStartMs,
-    nowMs
+    nowMs,
+    includeEmptyMinutes: true,
+    carryForwardOnEmpty: false
   });
-  const candles = aggregateCandles(minuteCandles, timeframe);
+  const hydratedCandles = aggregateCandles(minuteCandles, timeframe);
+  const scaffold = buildTimeScaffold(timeframe, sessionState.dayStartMs, nowMs);
+  const hydratedByTime = new Map(hydratedCandles.map((bar) => [bar.time, { ...bar, isPlaceholder: false, state: 'hydrated' }]));
+  const candles = scaffold.map((slot) => hydratedByTime.get(slot.time) || { ...slot, state: 'placeholder' });
+
   const vwap = computeSessionVwapFromTrades(sessionState.trades, timeframe, {
     sessionStartMs: sessionState.dayStartMs,
     nowMs
@@ -201,6 +290,10 @@ function buildSessionPayload(timeframe = '1m') {
     return acc;
   }, {});
 
+  const placeholderCount = candles.filter((bar) => bar.isPlaceholder).length;
+  const hydratedCount = candles.length - placeholderCount;
+  const realOhlcVariance = new Set(hydratedCandles.map((bar) => `${bar.open}:${bar.high}:${bar.low}:${bar.close}`)).size;
+
   return {
     symbol: SYMBOL,
     timeframe,
@@ -212,8 +305,12 @@ function buildSessionPayload(timeframe = '1m') {
     debug: {
       sessionTradeCount: sessionState.trades.length,
       sessionCandleCount: candles.length,
+      hydratedCandleCount: hydratedCount,
+      placeholderCandleCount: placeholderCount,
+      realOhlcVariance,
       timeframeCounts,
       startsAtUtcMidnight: sessionState.dayStartMs === getUtcDayStartMs(nowMs),
+      hydration: sessionState.hydration,
       vwapCurrent: vwap.at(-1)?.value || null,
       vwapHasVariance: new Set(vwap.map((point) => point.value.toFixed(8))).size > 1,
       cvdCurrent: cvd.at(-1)?.close || null,
@@ -262,16 +359,7 @@ const stream = new BinanceStreamService({
     saveTrade(trade);
     ensureCurrentSession(trade.trade_time);
 
-    if (!sessionState.tradeIds.has(trade.trade_id) && trade.trade_time >= sessionState.dayStartMs) {
-      sessionState.tradeIds.add(trade.trade_id);
-      const lastTrade = sessionState.trades.at(-1);
-      if (!lastTrade || trade.trade_time > lastTrade.trade_time || (trade.trade_time === lastTrade.trade_time && trade.trade_id > lastTrade.trade_id)) {
-        sessionState.trades.push(trade);
-      } else {
-        sessionState.trades.push(trade);
-        sessionState.trades.sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
-      }
-    }
+    insertTradeIntoSession(trade);
 
     io.emit('trade', trade);
   },
@@ -424,6 +512,10 @@ app.get('/api/session/debug', (_req, res) => {
     latestVwap: snapshot.debug.vwapCurrent,
     latestCvd: snapshot.debug.cvdCurrent,
     timeframeCounts: snapshot.debug.timeframeCounts,
+    hydratedCandleCount: snapshot.debug.hydratedCandleCount,
+    placeholderCandleCount: snapshot.debug.placeholderCandleCount,
+    realOhlcVariance: snapshot.debug.realOhlcVariance,
+    hydration: snapshot.debug.hydration,
     vwapHasVariance: snapshot.debug.vwapHasVariance,
     cvdBarsWithTrades: snapshot.debug.cvdBarsWithTrades
   });

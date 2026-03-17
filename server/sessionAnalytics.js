@@ -23,7 +23,15 @@ function sortTrades(trades) {
   return [...trades].sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
 }
 
-export function buildCanonicalMinuteCandles(trades, { sessionStartMs, nowMs = Date.now() } = {}) {
+export function buildCanonicalMinuteCandles(
+  trades,
+  {
+    sessionStartMs,
+    nowMs = Date.now(),
+    includeEmptyMinutes = true,
+    carryForwardOnEmpty = true
+  } = {}
+) {
   const ordered = sortTrades(trades);
   const resolvedSessionStartMs = sessionStartMs ?? getUtcDayStartMs(nowMs);
   const startSec = Math.floor(resolvedSessionStartMs / 1000);
@@ -57,6 +65,10 @@ export function buildCanonicalMinuteCandles(trades, { sessionStartMs, nowMs = Da
     existing.hasTrades = true;
   });
 
+  if (!includeEmptyMinutes) {
+    return [...minuteMap.values()].sort((a, b) => a.time - b.time);
+  }
+
   const candles = [];
   let lastClose = ordered.length ? Number(ordered[0].price) : 0;
   for (let ts = startSec; ts <= endSec; ts += 60) {
@@ -64,7 +76,7 @@ export function buildCanonicalMinuteCandles(trades, { sessionStartMs, nowMs = Da
     if (existing) {
       lastClose = existing.close;
       candles.push(existing);
-    } else {
+    } else if (carryForwardOnEmpty) {
       candles.push({
         time: ts,
         open: lastClose,
@@ -74,6 +86,17 @@ export function buildCanonicalMinuteCandles(trades, { sessionStartMs, nowMs = Da
         volume: 0,
         hasTrades: false
       });
+    } else {
+      candles.push({
+        time: ts,
+        open: null,
+        high: null,
+        low: null,
+        close: null,
+        volume: 0,
+        hasTrades: false,
+        isPlaceholder: true
+      });
     }
   }
 
@@ -81,14 +104,16 @@ export function buildCanonicalMinuteCandles(trades, { sessionStartMs, nowMs = Da
 }
 
 export function aggregateCandles(candles, timeframe = '1m') {
+  const hydratedOnly = candles.filter((candle) => Number.isFinite(candle.open) && Number.isFinite(candle.close));
+
   if (timeframe === '1m') {
-    return candles.map(({ time, open, high, low, close, volume, hasTrades }) => ({ time, open, high, low, close, volume, hasTrades }));
+    return hydratedOnly.map(({ time, open, high, low, close, volume, hasTrades }) => ({ time, open, high, low, close, volume, hasTrades }));
   }
 
   const tfSec = timeframeToSeconds(timeframe);
   const buckets = new Map();
 
-  candles.forEach((candle) => {
+  hydratedOnly.forEach((candle) => {
     const bucket = bucketTime(candle.time, timeframe);
     const existing = buckets.get(bucket);
     if (!existing) {
