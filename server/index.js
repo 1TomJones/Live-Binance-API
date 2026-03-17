@@ -125,10 +125,14 @@ function ensureCvdMinuteCandle(minuteTimeSec) {
   return candle;
 }
 
+function getTradeCandleTimeSec(tradeTimeMs, candleIntervalSec = 60) {
+  return Math.floor(Math.floor(Number(tradeTimeMs) / 1000) / candleIntervalSec) * candleIntervalSec;
+}
+
 
 function applyTradeToMinuteCandle(trade) {
   if (!trade || trade.trade_time < sessionState.dayStartMs) return;
-  const minuteTimeSec = Math.floor(trade.trade_time / 1000 / 60) * 60;
+  const minuteTimeSec = getTradeCandleTimeSec(trade.trade_time, 60);
   const existingIndex = sessionState.minuteCandleIndex.get(minuteTimeSec);
   const price = Number(trade.price || 0);
   const quantity = Number(trade.quantity || 0);
@@ -164,7 +168,7 @@ function applyTradeToDerivedState(trade) {
 
   const quantity = Number(trade.quantity || 0);
   const delta = trade.maker_flag ? -quantity : quantity;
-  const minuteTimeSec = Math.floor(trade.trade_time / 1000 / 60) * 60;
+  const minuteTimeSec = getTradeCandleTimeSec(trade.trade_time, 60);
 
   const cvdCandle = ensureCvdMinuteCandle(minuteTimeSec);
   sessionState.cvdRunning += delta;
@@ -173,7 +177,7 @@ function applyTradeToDerivedState(trade) {
   cvdCandle.close = sessionState.cvdRunning;
   cvdCandle.hasTrades = true;
 
-  const profileBucket = Math.floor(Number(trade.price));
+  const profileBucket = Math.round(Number(trade.price));
   sessionState.volumeProfile.set(profileBucket, (sessionState.volumeProfile.get(profileBucket) || 0) + quantity);
 
   sessionState.lastProcessedTradeId = trade.trade_id;
@@ -256,7 +260,7 @@ async function fetchBinanceWithFallback(endpointPath, search, { timeoutMs = 1000
 }
 
 async function backfillCurrentSessionTradesFromBinance(dayStartMs, nowMs) {
-  let processed = 0;
+  const backfilledTrades = [];
   let fetched = 0;
   let cursorStartTime = dayStartMs;
 
@@ -278,17 +282,24 @@ async function backfillCurrentSessionTradesFromBinance(dayStartMs, nowMs) {
     fetched += batch.length;
     let highestTradeTime = cursorStartTime;
 
-    for (const item of batch) {
+    batch.forEach((item) => {
       const trade = normalizeAggTrade(item);
-      if (trade.trade_time < dayStartMs || trade.trade_time > nowMs) continue;
-      if (applyTradeToDerivedState(trade)) processed += 1;
+      if (trade.trade_time < dayStartMs || trade.trade_time > nowMs) return;
+      backfilledTrades.push(trade);
       highestTradeTime = Math.max(highestTradeTime, trade.trade_time);
-    }
+    });
 
     const nextCursor = highestTradeTime + 1;
     if (nextCursor <= cursorStartTime || nextCursor > nowMs) break;
     cursorStartTime = nextCursor;
   }
+
+  backfilledTrades.sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
+
+  let processed = 0;
+  backfilledTrades.forEach((trade) => {
+    if (applyTradeToDerivedState(trade)) processed += 1;
+  });
 
   return { fetched, processed };
 }
