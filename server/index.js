@@ -34,12 +34,12 @@ import { BacktestRunner } from './quant/backtestRunner.js';
 import { createDefaultLivePaperRunner } from './quant/livePaperRunner.js';
 import { StrategyUploadService, StrategyValidationService } from './quant/strategyServices.js';
 import {
-  buildCandlesFromTrades,
   buildVolumeProfileByDollar,
   computeSessionCvdFromTrades,
   computeSessionVwapFromTrades,
+  aggregateCandles,
+  buildCanonicalMinuteCandles,
   getUtcDayStartMs,
-  timeframeToSeconds
 } from './sessionAnalytics.js';
 
 const PORT = process.env.PORT || 3000;
@@ -101,7 +101,6 @@ async function backfillCurrentSessionFromBinance(dayStartMs, nowMs) {
     if (lastTs <= cursor) break;
     cursor = lastTs + 1;
 
-    if (collected.length > 300000) break;
   }
 
   return collected;
@@ -111,7 +110,7 @@ async function initializeCurrentSession() {
   const nowMs = Date.now();
   const dayStartMs = getUtcDayStartMs(nowMs);
 
-  const dbTrades = getTradesByRange(SYMBOL, dayStartMs, nowMs, 350000);
+  const dbTrades = getTradesByRange(SYMBOL, dayStartMs, nowMs, null);
   let sessionTrades = dbTrades;
 
   const presentCount = getTradesCountByRange(SYMBOL, dayStartMs, nowMs);
@@ -134,9 +133,25 @@ async function initializeCurrentSession() {
 
 function buildSessionPayload(timeframe = '1m') {
   ensureCurrentSession();
-  const candles = buildCandlesFromTrades(sessionState.trades, timeframe);
-  const vwap = computeSessionVwapFromTrades(sessionState.trades, timeframe);
-  const cvd = computeSessionCvdFromTrades(sessionState.trades, timeframe);
+  const nowMs = Date.now();
+  const minuteCandles = buildCanonicalMinuteCandles(sessionState.trades, {
+    sessionStartMs: sessionState.dayStartMs,
+    nowMs
+  });
+  const candles = aggregateCandles(minuteCandles, timeframe);
+  const vwap = computeSessionVwapFromTrades(sessionState.trades, timeframe, {
+    sessionStartMs: sessionState.dayStartMs,
+    nowMs
+  });
+  const cvd = computeSessionCvdFromTrades(sessionState.trades, timeframe, {
+    sessionStartMs: sessionState.dayStartMs,
+    nowMs
+  });
+
+  const timeframeCounts = ['1m', '5m', '15m', '1h'].reduce((acc, tf) => {
+    acc[tf] = aggregateCandles(minuteCandles, tf).length;
+    return acc;
+  }, {});
 
   return {
     symbol: SYMBOL,
@@ -149,9 +164,12 @@ function buildSessionPayload(timeframe = '1m') {
     debug: {
       sessionTradeCount: sessionState.trades.length,
       sessionCandleCount: candles.length,
-      startsAtUtcMidnight: sessionState.dayStartMs === getUtcDayStartMs(),
+      timeframeCounts,
+      startsAtUtcMidnight: sessionState.dayStartMs === getUtcDayStartMs(nowMs),
       vwapCurrent: vwap.at(-1)?.value || null,
-      cvdCurrent: cvd.at(-1)?.close || null
+      vwapHasVariance: new Set(vwap.map((point) => point.value.toFixed(8))).size > 1,
+      cvdCurrent: cvd.at(-1)?.close || null,
+      cvdBarsWithTrades: cvd.filter((bar) => bar.hasTrades).length
     }
   };
 }
@@ -198,8 +216,13 @@ const stream = new BinanceStreamService({
 
     if (!sessionState.tradeIds.has(trade.trade_id) && trade.trade_time >= sessionState.dayStartMs) {
       sessionState.tradeIds.add(trade.trade_id);
-      sessionState.trades.push(trade);
-      sessionState.trades.sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
+      const lastTrade = sessionState.trades.at(-1);
+      if (!lastTrade || trade.trade_time > lastTrade.trade_time || (trade.trade_time === lastTrade.trade_time && trade.trade_id > lastTrade.trade_id)) {
+        sessionState.trades.push(trade);
+      } else {
+        sessionState.trades.push(trade);
+        sessionState.trades.sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
+      }
     }
 
     io.emit('trade', trade);
@@ -328,10 +351,9 @@ app.get('/api/indicators/volume-profile', (req, res) => {
   }
 
   ensureCurrentSession();
-  const tfSec = timeframeToSeconds(timeframe);
-  const alignedStartMs = Math.floor(from / tfSec) * tfSec * 1000;
-  const alignedEndMs = (Math.floor(to / tfSec) * tfSec + tfSec) * 1000 - 1;
-  const trades = sessionState.trades.filter((trade) => trade.trade_time >= alignedStartMs && trade.trade_time <= alignedEndMs);
+  const fromMs = Math.floor(from * 1000);
+  const toMs = Math.ceil(to * 1000);
+  const trades = sessionState.trades.filter((trade) => trade.trade_time >= fromMs && trade.trade_time <= toMs);
   const profile = buildVolumeProfileByDollar(trades);
   return res.json({ symbol: SYMBOL, timeframe, from, to, profile });
 });
@@ -346,7 +368,10 @@ app.get('/api/session/debug', (_req, res) => {
     sessionCandleCount1m: snapshot.debug.sessionCandleCount,
     startsAtUtcMidnight: snapshot.debug.startsAtUtcMidnight,
     latestVwap: snapshot.debug.vwapCurrent,
-    latestCvd: snapshot.debug.cvdCurrent
+    latestCvd: snapshot.debug.cvdCurrent,
+    timeframeCounts: snapshot.debug.timeframeCounts,
+    vwapHasVariance: snapshot.debug.vwapHasVariance,
+    cvdBarsWithTrades: snapshot.debug.cvdBarsWithTrades
   });
 });
 

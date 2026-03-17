@@ -19,25 +19,33 @@ export function bucketTime(unixSeconds, timeframe = '1m') {
   return Math.floor(unixSeconds / sec) * sec;
 }
 
-export function buildCandlesFromTrades(trades, timeframe = '1m') {
-  const buckets = new Map();
-  const ordered = [...trades].sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
+function sortTrades(trades) {
+  return [...trades].sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
+}
 
+export function buildCanonicalMinuteCandles(trades, { sessionStartMs, nowMs = Date.now() } = {}) {
+  const ordered = sortTrades(trades);
+  const resolvedSessionStartMs = sessionStartMs ?? getUtcDayStartMs(nowMs);
+  const startSec = Math.floor(resolvedSessionStartMs / 1000);
+  const endSec = bucketTime(Math.floor(nowMs / 1000), '1m');
+
+  const minuteMap = new Map();
   ordered.forEach((trade) => {
-    const tradeSec = Math.floor(trade.trade_time / 1000);
-    const candleTime = bucketTime(tradeSec, timeframe);
+    if (trade.trade_time < resolvedSessionStartMs || trade.trade_time > nowMs) return;
+    const time = bucketTime(Math.floor(trade.trade_time / 1000), '1m');
     const price = Number(trade.price);
-    const quantity = Number(trade.quantity || 0);
+    const volume = Number(trade.quantity || 0);
 
-    const existing = buckets.get(candleTime);
+    const existing = minuteMap.get(time);
     if (!existing) {
-      buckets.set(candleTime, {
-        time: candleTime,
+      minuteMap.set(time, {
+        time,
         open: price,
         high: price,
         low: price,
         close: price,
-        volume: quantity
+        volume,
+        hasTrades: true
       });
       return;
     }
@@ -45,31 +53,93 @@ export function buildCandlesFromTrades(trades, timeframe = '1m') {
     existing.high = Math.max(existing.high, price);
     existing.low = Math.min(existing.low, price);
     existing.close = price;
-    existing.volume += quantity;
+    existing.volume += volume;
+    existing.hasTrades = true;
   });
 
-  return [...buckets.values()].sort((a, b) => a.time - b.time);
+  const candles = [];
+  let lastClose = ordered.length ? Number(ordered[0].price) : 0;
+  for (let ts = startSec; ts <= endSec; ts += 60) {
+    const existing = minuteMap.get(ts);
+    if (existing) {
+      lastClose = existing.close;
+      candles.push(existing);
+    } else {
+      candles.push({
+        time: ts,
+        open: lastClose,
+        high: lastClose,
+        low: lastClose,
+        close: lastClose,
+        volume: 0,
+        hasTrades: false
+      });
+    }
+  }
+
+  return candles;
 }
 
-export function computeSessionVwapFromTrades(trades, timeframe = '1m') {
+export function aggregateCandles(candles, timeframe = '1m') {
+  if (timeframe === '1m') {
+    return candles.map(({ time, open, high, low, close, volume, hasTrades }) => ({ time, open, high, low, close, volume, hasTrades }));
+  }
+
+  const tfSec = timeframeToSeconds(timeframe);
+  const buckets = new Map();
+
+  candles.forEach((candle) => {
+    const bucket = bucketTime(candle.time, timeframe);
+    const existing = buckets.get(bucket);
+    if (!existing) {
+      buckets.set(bucket, {
+        time: bucket,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: Number(candle.volume || 0),
+        hasTrades: Boolean(candle.hasTrades)
+      });
+      return;
+    }
+
+    existing.high = Math.max(existing.high, candle.high);
+    existing.low = Math.min(existing.low, candle.low);
+    existing.close = candle.close;
+    existing.volume += Number(candle.volume || 0);
+    existing.hasTrades = existing.hasTrades || Boolean(candle.hasTrades);
+  });
+
+  const aggregated = [...buckets.values()].sort((a, b) => a.time - b.time);
+  for (let i = 1; i < aggregated.length; i += 1) {
+    if (!aggregated[i].hasTrades) {
+      const prevClose = aggregated[i - 1].close;
+      aggregated[i].open = prevClose;
+      aggregated[i].high = prevClose;
+      aggregated[i].low = prevClose;
+      aggregated[i].close = prevClose;
+    }
+  }
+
+  return aggregated;
+}
+
+export function buildCandlesFromTrades(trades, timeframe = '1m', options = {}) {
+  const minuteCandles = buildCanonicalMinuteCandles(trades, options);
+  return aggregateCandles(minuteCandles, timeframe);
+}
+
+export function computeSessionVwapFromCandles(candles) {
   const running = [];
   let cumulativePv = 0;
   let cumulativeVolume = 0;
-  let activeDayStart = null;
 
-  const candles = buildCandlesFromTrades(trades, timeframe);
   candles.forEach((candle) => {
-    const candleMs = candle.time * 1000;
-    const dayStart = getUtcDayStartMs(candleMs);
-    if (activeDayStart !== dayStart) {
-      activeDayStart = dayStart;
-      cumulativePv = 0;
-      cumulativeVolume = 0;
-    }
-
     const typicalPrice = (candle.high + candle.low + candle.close) / 3;
-    cumulativePv += typicalPrice * Number(candle.volume || 0);
-    cumulativeVolume += Number(candle.volume || 0);
+    const volume = Number(candle.volume || 0);
+    cumulativePv += typicalPrice * volume;
+    cumulativeVolume += volume;
 
     running.push({
       time: candle.time,
@@ -80,28 +150,31 @@ export function computeSessionVwapFromTrades(trades, timeframe = '1m') {
   return running;
 }
 
-export function computeSessionCvdFromTrades(trades, timeframe = '1m') {
-  const ordered = [...trades].sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
+export function computeSessionVwapFromTrades(trades, timeframe = '1m', options = {}) {
+  const candles = buildCandlesFromTrades(trades, timeframe, options);
+  return computeSessionVwapFromCandles(candles);
+}
+
+export function computeSessionCvdFromTrades(trades, timeframe = '1m', { sessionStartMs, nowMs = Date.now() } = {}) {
+  const ordered = sortTrades(trades);
+  const resolvedSessionStartMs = sessionStartMs ?? getUtcDayStartMs(nowMs);
+  const startSec = Math.floor(resolvedSessionStartMs / 1000);
+  const endSec = bucketTime(Math.floor(nowMs / 1000), timeframe);
+
   const buckets = new Map();
   let running = 0;
-  let activeDayStart = null;
 
   ordered.forEach((trade) => {
-    const dayStart = getUtcDayStartMs(trade.trade_time);
-    if (activeDayStart !== dayStart) {
-      activeDayStart = dayStart;
-      running = 0;
-    }
-
-    const tradeSec = Math.floor(trade.trade_time / 1000);
-    const candleTime = bucketTime(tradeSec, timeframe);
+    if (trade.trade_time < resolvedSessionStartMs || trade.trade_time > nowMs) return;
+    const candleTime = bucketTime(Math.floor(trade.trade_time / 1000), timeframe);
     if (!buckets.has(candleTime)) {
       buckets.set(candleTime, {
         time: candleTime,
         open: running,
         high: running,
         low: running,
-        close: running
+        close: running,
+        hasTrades: false
       });
     }
 
@@ -111,9 +184,23 @@ export function computeSessionCvdFromTrades(trades, timeframe = '1m') {
     candle.high = Math.max(candle.high, running);
     candle.low = Math.min(candle.low, running);
     candle.close = running;
+    candle.hasTrades = true;
   });
 
-  return [...buckets.values()].sort((a, b) => a.time - b.time);
+  const tfSec = timeframeToSeconds(timeframe);
+  const result = [];
+  let previousClose = 0;
+  for (let ts = bucketTime(startSec, timeframe); ts <= endSec; ts += tfSec) {
+    const existing = buckets.get(ts);
+    if (existing) {
+      previousClose = existing.close;
+      result.push(existing);
+    } else {
+      result.push({ time: ts, open: previousClose, high: previousClose, low: previousClose, close: previousClose, hasTrades: false });
+    }
+  }
+
+  return result;
 }
 
 export function buildVolumeProfileByDollar(trades) {
