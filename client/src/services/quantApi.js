@@ -16,5 +16,7 @@ export const quantApi = {
   cancelBacktest: (jobId) => request(`/api/quant/backtests/${jobId}/cancel`, { method: 'POST', body: '{}' }),
   getBacktestJob: (jobId) => request(`/api/quant/backtests/${jobId}`),
   listRuns: () => request('/api/quant/runs'),
-  getLiveMetrics: () => request('/api/quant/live-metrics')
+  getLiveMetrics: () => request('/api/quant/live-metrics'),
+  startLivePaper: (payload) => request('/api/quant/live/start', { method: 'POST', body: JSON.stringify(payload) }),
+  stopLivePaper: () => request('/api/quant/live/stop', { method: 'POST', body: '{}' })
 };

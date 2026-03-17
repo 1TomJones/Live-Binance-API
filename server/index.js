@@ -20,14 +20,19 @@ import {
   listQuantJobProgress,
   saveBookTicker,
   saveQuantBacktestResult,
+  saveQuantLiveRun,
   saveQuantStrategy,
   saveTrade,
   saveTradesBatch,
-  updateQuantBacktestJob
+  updateQuantBacktestJob,
+  getQuantStrategyById
 } from './db.js';
-import { BacktestJobService, StrategyExecutionService } from './quant/backtestJobService.js';
-import { LiveStrategyRunner } from './quant/liveMetricsStore.js';
-import { StrategyParserService, StrategyUploadService, StrategyValidationService } from './quant/strategyServices.js';
+import { BacktestJobService } from './quant/backtestJobService.js';
+import { StrategyParser } from './quant/strategyParser.js';
+import { StrategyExecutionEngine } from './quant/strategyExecutionEngine.js';
+import { BacktestRunner } from './quant/backtestRunner.js';
+import { createDefaultLivePaperRunner } from './quant/livePaperRunner.js';
+import { StrategyUploadService, StrategyValidationService } from './quant/strategyServices.js';
 import {
   buildCandlesFromTrades,
   buildVolumeProfileByDollar,
@@ -153,12 +158,21 @@ function buildSessionPayload(timeframe = '1m') {
 
 const strategyUploadService = new StrategyUploadService({
   validationService: new StrategyValidationService(),
-  parserService: new StrategyParserService(),
+  parserService: new StrategyParser(),
   saveStrategyRecord: saveQuantStrategy
 });
 
+const strategyParser = new StrategyParser();
+const executionEngine = new StrategyExecutionEngine();
+const backtestRunner = new BacktestRunner({
+  executionEngine,
+  loadTrades: ({ symbol, startMs, endMs, limit }) => getTradesByRange(symbol, startMs, endMs, limit)
+});
+
 const backtestJobService = new BacktestJobService({
-  executionService: new StrategyExecutionService(),
+  backtestRunner,
+  strategyParser,
+  getStrategyById: getQuantStrategyById,
   createJob: createQuantBacktestJob,
   updateJob: updateQuantBacktestJob,
   completeJob: completeQuantBacktestJob,
@@ -168,7 +182,12 @@ const backtestJobService = new BacktestJobService({
   getJobById: getQuantBacktestJobById
 });
 
-const liveStrategyRunner = new LiveStrategyRunner();
+const liveStrategyRunner = createDefaultLivePaperRunner({
+  executionEngine,
+  loadTrades: ({ symbol, startMs, endMs, limit }) => getTradesByRange(symbol, startMs, endMs, limit),
+  saveLiveState: ({ strategyId, status, stateJson }) => saveQuantLiveRun({ strategyId, status, stateJson }),
+  getLiveState: () => null
+});
 
 const stream = new BinanceStreamService({
   symbol: SYMBOL,
@@ -257,11 +276,22 @@ app.get('/api/quant/runs', (_req, res) => {
 });
 
 app.get('/api/quant/live-metrics', (_req, res) => {
-  return res.json({ metrics: liveStrategyRunner.getSnapshot() });
+  const snapshot = liveStrategyRunner.tick() || liveStrategyRunner.getSnapshot();
+  return res.json({ metrics: snapshot?.metrics || snapshot });
 });
 
-app.post('/api/quant/live-metrics', (req, res) => {
-  return res.json({ metrics: liveStrategyRunner.update(req.body || {}) });
+app.post('/api/quant/live/start', (req, res) => {
+  const { strategyId, runConfig } = req.body || {};
+  const strategyRecord = getQuantStrategyById(Number(strategyId));
+  if (!strategyRecord) return res.status(404).json({ error: 'Strategy not found' });
+  const parsed = strategyParser.parse(strategyRecord.raw_content);
+  if (!parsed.valid) return res.status(400).json({ error: parsed.errors.join(', ') });
+  const run = liveStrategyRunner.start({ strategyId: Number(strategyId), strategy: parsed.strategy, runConfig: runConfig || {} });
+  return res.json({ run });
+});
+
+app.post('/api/quant/live/stop', (_req, res) => {
+  return res.json({ run: liveStrategyRunner.stop() });
 });
 
 app.get('/api/session/snapshot', (req, res) => {
