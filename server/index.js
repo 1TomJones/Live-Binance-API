@@ -48,6 +48,11 @@ const BINANCE_REST_BASES = [
   'https://data-api.binance.vision/api/v3'
 ].filter(Boolean);
 
+const BINANCE_AGG_TRADES_REST_BASES = [
+  process.env.BINANCE_AGG_TRADES_URL,
+  'https://data-api.binance.vision/api/v3/aggTrades'
+].filter(Boolean);
+
 class NonRetryableInitializationError extends Error {
   constructor(message) {
     super(message);
@@ -120,6 +125,39 @@ function ensureCvdMinuteCandle(minuteTimeSec) {
   return candle;
 }
 
+
+function applyTradeToMinuteCandle(trade) {
+  if (!trade || trade.trade_time < sessionState.dayStartMs) return;
+  const minuteTimeSec = Math.floor(trade.trade_time / 1000 / 60) * 60;
+  const existingIndex = sessionState.minuteCandleIndex.get(minuteTimeSec);
+  const price = Number(trade.price || 0);
+  const quantity = Number(trade.quantity || 0);
+
+  if (existingIndex === undefined) {
+    const candle = {
+      time: minuteTimeSec,
+      open: price,
+      high: price,
+      low: price,
+      close: price,
+      volume: quantity,
+      hasTrades: true,
+      isPlaceholder: false
+    };
+    sessionState.minuteCandleIndex.set(minuteTimeSec, sessionState.minuteCandles.length);
+    sessionState.minuteCandles.push(candle);
+    return;
+  }
+
+  const candle = sessionState.minuteCandles[existingIndex];
+  candle.high = Math.max(Number(candle.high ?? price), price);
+  candle.low = Math.min(Number(candle.low ?? price), price);
+  candle.close = price;
+  candle.volume = Number(candle.volume || 0) + quantity;
+  candle.hasTrades = true;
+  candle.isPlaceholder = false;
+}
+
 function applyTradeToDerivedState(trade) {
   if (!trade || trade.trade_time < sessionState.dayStartMs) return false;
   if (Number.isFinite(sessionState.lastProcessedTradeId) && trade.trade_id <= sessionState.lastProcessedTradeId) return false;
@@ -153,12 +191,16 @@ function normalizeAggTrade(trade) {
   };
 }
 
-async function fetchBinanceWithFallback(endpointPath, search, { timeoutMs = 10000, context = 'binance-request' } = {}) {
+async function fetchBinanceWithFallback(endpointPath, search, { timeoutMs = 10000, context = 'binance-request', baseUrls = BINANCE_REST_BASES } = {}) {
   const params = Object.fromEntries(search.entries());
   let lastFailure = null;
 
-  for (const baseUrl of BINANCE_REST_BASES) {
-    const url = `${baseUrl}${endpointPath}?${search.toString()}`;
+  for (const baseUrl of baseUrls) {
+    const normalizedEndpointPath = endpointPath.startsWith('/') ? endpointPath.slice(1) : endpointPath;
+    const baseAlreadyTargetsEndpoint = baseUrl.endsWith(`/${normalizedEndpointPath}`);
+    const url = baseAlreadyTargetsEndpoint
+      ? `${baseUrl}?${search.toString()}`
+      : `${baseUrl}${endpointPath}?${search.toString()}`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -228,7 +270,8 @@ async function backfillCurrentSessionTradesFromBinance(dayStartMs, nowMs) {
     search.set('endTime', String(nowMs));
 
     const { payload: batch } = await fetchBinanceWithFallback('/aggTrades', search, {
-      context: 'session/hydration/aggTrades'
+      context: 'session/hydration/aggTrades',
+      baseUrls: [...BINANCE_AGG_TRADES_REST_BASES, ...BINANCE_REST_BASES]
     });
     if (!batch.length) break;
 
@@ -349,16 +392,18 @@ async function initializeCurrentSession() {
     lastError: null
   };
 
+  console.info('Starting candle backfill', { dayStartIso: new Date(dayStartMs).toISOString() });
   const backfilledCandles = await backfillCurrentSessionCandlesFromBinance(dayStartMs, nowMs);
   const mergedCandleCount = mergeMinuteCandlesIntoSession(backfilledCandles);
   let tradeBackfill = { fetched: 0, processed: 0 };
   let tradeBackfillError = null;
 
+  console.info('Starting trade backfill', { dayStartIso: new Date(dayStartMs).toISOString() });
   try {
     tradeBackfill = await backfillCurrentSessionTradesFromBinance(dayStartMs, nowMs);
   } catch (error) {
     tradeBackfillError = error;
-    console.error('[session/hydration] aggTrades backfill failed; continuing with candle hydration only', {
+    console.error('Trade backfill failed, continuing with live stream', {
       dayStartIso: new Date(dayStartMs).toISOString(),
       error: error?.message || String(error)
     });
@@ -386,37 +431,18 @@ async function initializeCurrentSession() {
   });
 }
 
-async function initializeCurrentSessionWithRetries() {
-  let attempt = 0;
-
-  while (true) {
-    attempt += 1;
-    try {
-      await initializeCurrentSession();
-      console.log(`Current session initialized (attempt ${attempt}).`);
-      return;
-    } catch (error) {
-      if (error instanceof NonRetryableInitializationError) {
-        sessionState.hydration = {
-          ...sessionState.hydration,
-          status: 'failed',
-          finishedAt: Date.now(),
-          lastError: error?.message || String(error)
-        };
-        console.error('Session initialization aborted due to non-retryable error.', error);
-        throw error;
-      }
-
-      sessionState.hydration = {
-        ...sessionState.hydration,
-        status: 'failed',
-        finishedAt: Date.now(),
-        lastError: error?.message || String(error)
-      };
-      const retryDelayMs = Math.min(30000, 1000 * 2 ** Math.min(attempt - 1, 5));
-      console.error(`Session initialization failed (attempt ${attempt}). Retrying in ${retryDelayMs}ms.`, error);
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-    }
+async function initializeCurrentSessionSafe() {
+  try {
+    await initializeCurrentSession();
+    console.log('Current session initialized.');
+  } catch (error) {
+    sessionState.hydration = {
+      ...sessionState.hydration,
+      status: 'failed',
+      finishedAt: Date.now(),
+      lastError: error?.message || String(error)
+    };
+    console.error('Session initialization failed; continuing with live streams.', error);
   }
 }
 
@@ -509,6 +535,7 @@ const stream = new BinanceStreamService({
     saveTrade(trade);
     ensureCurrentSession(trade.trade_time);
 
+    applyTradeToMinuteCandle(trade);
     applyTradeToDerivedState(trade);
 
     io.emit('trade', trade);
@@ -525,6 +552,9 @@ const stream = new BinanceStreamService({
   onCandle: (candle) => {
     ensureCurrentSession(candle.time * 1000);
     mergeMinuteCandlesIntoSession([{ ...candle, hasTrades: true, isPlaceholder: false }]);
+  },
+  onTradeConnected: ({ stream }) => {
+    console.info('Connected to Binance trade websocket', { stream });
   }
 });
 
@@ -532,13 +562,8 @@ server.listen(PORT, () => {
   console.log(`Kent Invest Crypto Tape Terminal listening on ${PORT}`);
 });
 
-initializeCurrentSessionWithRetries()
-  .then(() => {
-    stream.start();
-  })
-  .catch((error) => {
-    console.error('Unexpected fatal error while initializing current session.', error);
-  });
+stream.start();
+initializeCurrentSessionSafe();
 
 io.on('connection', (socket) => {
   const recent = getRecentTrades(SYMBOL, 500).reverse();

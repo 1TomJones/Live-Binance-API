@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 
-const WS_BASE = 'wss://data-stream.binance.vision/ws';
+const WS_BASE = 'wss://stream.binance.com:9443/ws';
 const REST_BASE = 'https://api.binance.com/api/v3';
 
 function buildDepthPayload(symbol, bids, asks, ts) {
@@ -41,13 +41,14 @@ function buildDepthPayload(symbol, bids, asks, ts) {
 }
 
 export class BinanceStreamService {
-  constructor({ symbol = 'btcusdt', onTrade, onBookTicker, onDepth, onCandle, onCandleBootstrap }) {
+  constructor({ symbol = 'btcusdt', onTrade, onBookTicker, onDepth, onCandle, onCandleBootstrap, onTradeConnected }) {
     this.symbol = symbol.toLowerCase();
     this.onTrade = onTrade;
     this.onBookTicker = onBookTicker;
     this.onDepth = onDepth;
     this.onCandle = onCandle;
     this.onCandleBootstrap = onCandleBootstrap;
+    this.onTradeConnected = onTradeConnected;
 
     this.tradeSocket = null;
     this.bookSocket = null;
@@ -110,13 +111,17 @@ export class BinanceStreamService {
   }
 
   connectTrade() {
-    const url = `${WS_BASE}/${this.symbol}@trade`;
+    const url = `${WS_BASE}/${this.symbol}@aggTrade`;
     this.tradeSocket = new WebSocket(url);
+
+    this.tradeSocket.on('open', () => {
+      this.onTradeConnected?.({ symbol: this.symbol, stream: `${this.symbol}@aggTrade` });
+    });
 
     this.tradeSocket.on('message', (raw) => {
       const msg = JSON.parse(raw.toString());
       const trade = {
-        trade_id: msg.t,
+        trade_id: msg.a,
         symbol: msg.s,
         price: Number(msg.p),
         quantity: Number(msg.q),
