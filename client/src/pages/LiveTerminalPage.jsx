@@ -160,7 +160,7 @@ export function LiveTerminalPage() {
         </div>
         <TradeTape trades={trades} />
       </section>
-      <footer className="terminal-footer">Binance streams: BTCUSDT@depth@100ms · @trade · @kline_1m · multi-timeframe + order-flow indicators</footer>
+      <footer className="terminal-footer">Binance streams: BTCUSDT@depth@100ms · @trade · @kline_1m · multi-timeframe + CVD/VWAP/profile</footer>
     </main>
   );
 }

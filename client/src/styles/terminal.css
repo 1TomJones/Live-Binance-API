@@ -57,9 +57,40 @@ body { margin: 0; background: #060b13; }
 }
 
 .book-panel { display: flex; flex-direction: column; background: #080f1a; }
+.dom-summary {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 10px;
+  font-size: 11px;
+  border-bottom: 1px solid #1a263d;
+}
+.dom-summary .sell { color: #e56a75; }
+.dom-summary .buy { color: #34cb8f; }
+.dom-mode-toggle {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #1a263d;
+}
+.dom-mode-toggle button {
+  background: #0f1a2f;
+  color: #adc0e5;
+  border: 1px solid #243656;
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.dom-mode-toggle button.active {
+  color: #dce7fb;
+  border-color: #40639a;
+  background: #182841;
+}
+
 .book-columns, .book-row {
   display: grid;
-  grid-template-columns: 1fr .9fr .9fr;
+  grid-template-columns: 1fr .85fr 1fr;
   gap: 8px;
   padding: 4px 10px;
   font-size: 11px;
