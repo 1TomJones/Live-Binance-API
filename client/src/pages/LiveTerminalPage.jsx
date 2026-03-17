@@ -4,38 +4,108 @@ import { TopStatusBar } from '../components/TopStatusBar.jsx';
 import { TradeTape } from '../components/TradeTape.jsx';
 import { OrderBookLadder } from '../components/OrderBookLadder.jsx';
 import { CandlestickChart } from '../components/CandlestickChart.jsx';
+import { UI_LIMITS, UI_REFRESH_INTERVALS_MS } from '../constants/uiPerformance.js';
 
 const socket = io();
+
+function buildStatsSnapshot(windowTrades) {
+  const prices = windowTrades.map((trade) => trade.price);
+  const first = prices.at(-1);
+  const last = prices[0];
+  return {
+    first,
+    last,
+    high: prices.length ? Math.max(...prices) : null,
+    low: prices.length ? Math.min(...prices) : null,
+    movePct: first && last ? ((last - first) / first) * 100 : null
+  };
+}
 
 export function LiveTerminalPage() {
   const [trades, setTrades] = useState([]);
   const [book, setBook] = useState(null);
   const [depth, setDepth] = useState(null);
+  const [stats, setStats] = useState({ last: null, high: null, low: null, movePct: null });
   const [connected, setConnected] = useState(socket.connected);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const rootRef = useRef(null);
 
-  useEffect(() => {
-    socket.on('connect', () => setConnected(true));
-    socket.on('disconnect', () => setConnected(false));
+  const pendingTradesRef = useRef([]);
+  const statsTradesRef = useRef([]);
+  const pendingBookRef = useRef(null);
+  const pendingDepthRef = useRef(null);
+  const bookDirtyRef = useRef(false);
+  const depthDirtyRef = useRef(false);
 
-    socket.on('bootstrap', (payload) => {
-      setTrades(payload.trades || []);
+  useEffect(() => {
+    const onConnect = () => setConnected(true);
+    const onDisconnect = () => setConnected(false);
+
+    const onBootstrap = (payload) => {
+      const bootstrapTrades = payload.trades || [];
+      const visibleTrades = bootstrapTrades.slice(0, UI_LIMITS.visibleTradeRows);
+      setTrades(visibleTrades);
+
+      statsTradesRef.current = bootstrapTrades.slice(0, UI_LIMITS.statsWindowSize);
+      setStats(buildStatsSnapshot(statsTradesRef.current));
+
       setBook(payload.latestBook || null);
       setDepth(payload.depth || null);
-    });
+      pendingBookRef.current = payload.latestBook || null;
+      pendingDepthRef.current = payload.depth || null;
+      bookDirtyRef.current = false;
+      depthDirtyRef.current = false;
+    };
 
-    socket.on('trade', (trade) => {
-      setTrades((prev) => [trade, ...prev].slice(0, 900));
-    });
+    const onTrade = (trade) => {
+      pendingTradesRef.current.push(trade);
+      if (pendingTradesRef.current.length > UI_LIMITS.tradeBufferLimit) {
+        pendingTradesRef.current = pendingTradesRef.current.slice(-UI_LIMITS.tradeBufferLimit);
+      }
 
-    socket.on('bookTicker', (nextBook) => {
-      setBook(nextBook);
-    });
+      statsTradesRef.current = [trade, ...statsTradesRef.current].slice(0, UI_LIMITS.statsWindowSize);
+    };
 
-    socket.on('depth', (nextDepth) => {
-      setDepth(nextDepth);
-    });
+    const onBookTicker = (nextBook) => {
+      pendingBookRef.current = nextBook;
+      bookDirtyRef.current = true;
+    };
+
+    const onDepth = (nextDepth) => {
+      pendingDepthRef.current = nextDepth;
+      depthDirtyRef.current = true;
+    };
+
+    socket.on('connect', onConnect);
+    socket.on('disconnect', onDisconnect);
+    socket.on('bootstrap', onBootstrap);
+    socket.on('trade', onTrade);
+    socket.on('bookTicker', onBookTicker);
+    socket.on('depth', onDepth);
+
+    const tradesFlushTimer = setInterval(() => {
+      const pendingTrades = pendingTradesRef.current;
+      if (pendingTrades.length) {
+        const newTrades = pendingTrades.slice().reverse();
+        pendingTradesRef.current = [];
+        setTrades((prev) => [...newTrades, ...prev].slice(0, UI_LIMITS.visibleTradeRows));
+      }
+    }, UI_REFRESH_INTERVALS_MS.tradeTape);
+
+    const bookFlushTimer = setInterval(() => {
+      if (bookDirtyRef.current) {
+        setBook(pendingBookRef.current);
+        bookDirtyRef.current = false;
+      }
+      if (depthDirtyRef.current) {
+        setDepth(pendingDepthRef.current);
+        depthDirtyRef.current = false;
+      }
+    }, UI_REFRESH_INTERVALS_MS.orderBook);
+
+    const statsFlushTimer = setInterval(() => {
+      setStats(buildStatsSnapshot(statsTradesRef.current));
+    }, UI_REFRESH_INTERVALS_MS.stats);
 
     const onFullscreenChange = () => {
       setIsFullscreen(Boolean(document.fullscreenElement));
@@ -44,27 +114,20 @@ export function LiveTerminalPage() {
     document.addEventListener('fullscreenchange', onFullscreenChange);
 
     return () => {
-      socket.off('connect');
-      socket.off('disconnect');
-      socket.off('bootstrap');
-      socket.off('trade');
-      socket.off('bookTicker');
-      socket.off('depth');
+      socket.off('connect', onConnect);
+      socket.off('disconnect', onDisconnect);
+      socket.off('bootstrap', onBootstrap);
+      socket.off('trade', onTrade);
+      socket.off('bookTicker', onBookTicker);
+      socket.off('depth', onDepth);
+      clearInterval(tradesFlushTimer);
+      clearInterval(bookFlushTimer);
+      clearInterval(statsFlushTimer);
       document.removeEventListener('fullscreenchange', onFullscreenChange);
     };
   }, []);
 
-  const stats = useMemo(() => {
-    const prices = trades.map((t) => t.price);
-    const first = prices.at(-1);
-    const last = prices[0];
-    return {
-      last,
-      high: prices.length ? Math.max(...prices) : null,
-      low: prices.length ? Math.min(...prices) : null,
-      movePct: first && last ? ((last - first) / first) * 100 : null
-    };
-  }, [trades]);
+  const topBarSpread = useMemo(() => depth?.spread || (book ? book.ask_price - book.bid_price : null), [depth?.spread, book]);
 
   const toggleFullscreen = async () => {
     if (!document.fullscreenElement) {
@@ -85,7 +148,7 @@ export function LiveTerminalPage() {
         movePct={stats.movePct}
         bid={depth?.bestBid?.price || book?.bid_price}
         ask={depth?.bestAsk?.price || book?.ask_price}
-        spread={depth?.spread || (book ? book.ask_price - book.bid_price : null)}
+        spread={topBarSpread}
         connected={connected}
         onToggleFullscreen={toggleFullscreen}
         isFullscreen={isFullscreen}
@@ -93,7 +156,7 @@ export function LiveTerminalPage() {
       <section className="terminal-main">
         <OrderBookLadder depth={depth} />
         <div className="chart-region">
-          <CandlestickChart symbol="BTCUSDT" depth={depth} />
+          <CandlestickChart symbol="BTCUSDT" />
         </div>
         <TradeTape trades={trades} />
       </section>

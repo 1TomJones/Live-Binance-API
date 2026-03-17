@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { UI_REFRESH_INTERVALS_MS } from '../constants/uiPerformance.js';
 
 let lightweightChartsLoader = null;
 
@@ -26,7 +27,7 @@ const defaultIndicators = {
   heatmap: false
 };
 
-export function CandlestickChart({ symbol = 'BTCUSDT', depth }) {
+function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
   const containerRef = useRef(null);
   const overlayCanvasRef = useRef(null);
   const lowerContainerRef = useRef(null);
@@ -83,7 +84,7 @@ export function CandlestickChart({ symbol = 'BTCUSDT', depth }) {
     loadVwap();
     const timer = setInterval(loadVwap, 3500);
     return () => clearInterval(timer);
-  }, [indicators.vwap, timeframe, candles.length]);
+  }, [indicators.vwap, timeframe]);
 
   useEffect(() => {
     if (!indicators.cvd) {
@@ -124,7 +125,7 @@ export function CandlestickChart({ symbol = 'BTCUSDT', depth }) {
     loadImbalance();
     const timer = setInterval(loadImbalance, 1200);
     return () => clearInterval(timer);
-  }, [indicators.imbalance, depth?.ts]);
+  }, [indicators.imbalance]);
 
   useEffect(() => {
     if (!indicators.volumeProfile) {
@@ -141,7 +142,7 @@ export function CandlestickChart({ symbol = 'BTCUSDT', depth }) {
     loadProfile();
     const timer = setInterval(loadProfile, 4000);
     return () => clearInterval(timer);
-  }, [indicators.volumeProfile, candles.length]);
+  }, [indicators.volumeProfile]);
 
   useEffect(() => {
     if (!indicators.heatmap) {
@@ -158,7 +159,7 @@ export function CandlestickChart({ symbol = 'BTCUSDT', depth }) {
     loadHeatmap();
     const timer = setInterval(loadHeatmap, 1500);
     return () => clearInterval(timer);
-  }, [indicators.heatmap, depth?.ts]);
+  }, [indicators.heatmap]);
 
   useEffect(() => {
     let mounted = true;
@@ -265,8 +266,11 @@ export function CandlestickChart({ symbol = 'BTCUSDT', depth }) {
   useEffect(() => {
     if (!candleSeriesRef.current) return;
     candleSeriesRef.current.setData(candles.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
+  }, [candles]);
+
+  useEffect(() => {
     chartRef.current?.timeScale().fitContent();
-  }, [candles, timeframe]);
+  }, [timeframe]);
 
   useEffect(() => {
     if (!vwapSeriesRef.current) return;
@@ -298,6 +302,8 @@ export function CandlestickChart({ symbol = 'BTCUSDT', depth }) {
     const series = candleSeriesRef.current;
     if (!canvas || !chart || !series) return;
 
+    let rafId = null;
+    let timerId = null;
     const redraw = () => {
       const width = containerRef.current?.clientWidth || 0;
       const height = containerRef.current?.clientHeight || 0;
@@ -332,13 +338,26 @@ export function CandlestickChart({ symbol = 'BTCUSDT', depth }) {
       }
     };
 
+    const scheduleRedraw = () => {
+      if (rafId || timerId) return;
+      timerId = window.setTimeout(() => {
+        timerId = null;
+        rafId = window.requestAnimationFrame(() => {
+          rafId = null;
+          redraw();
+        });
+      }, UI_REFRESH_INTERVALS_MS.chartOverlay);
+    };
+
     redraw();
-    chart.timeScale().subscribeVisibleTimeRangeChange(redraw);
-    const resizeObs = new ResizeObserver(redraw);
+    chart.timeScale().subscribeVisibleTimeRangeChange(scheduleRedraw);
+    const resizeObs = new ResizeObserver(scheduleRedraw);
     if (containerRef.current) resizeObs.observe(containerRef.current);
 
     return () => {
-      chart.timeScale().unsubscribeVisibleTimeRangeChange(redraw);
+      if (timerId) window.clearTimeout(timerId);
+      if (rafId) window.cancelAnimationFrame(rafId);
+      chart.timeScale().unsubscribeVisibleTimeRangeChange(scheduleRedraw);
       resizeObs.disconnect();
     };
   }, [indicators.heatmap, indicators.volumeProfile, heatmapData, volumeProfile, candles.length]);
@@ -391,3 +410,5 @@ export function CandlestickChart({ symbol = 'BTCUSDT', depth }) {
     </div>
   );
 }
+
+export const CandlestickChart = memo(CandlestickChartComponent);
