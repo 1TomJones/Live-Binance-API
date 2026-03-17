@@ -32,6 +32,51 @@ db.exec(`
     ask_qty REAL NOT NULL,
     ts INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS quant_strategies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_name TEXT NOT NULL,
+    raw_content TEXT NOT NULL,
+    parse_status TEXT NOT NULL,
+    metadata_json TEXT,
+    parse_message TEXT,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS quant_backtest_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id INTEGER,
+    status TEXT NOT NULL,
+    progress_pct INTEGER NOT NULL DEFAULT 0,
+    processed_items INTEGER NOT NULL DEFAULT 0,
+    current_marker TEXT,
+    elapsed_ms INTEGER,
+    run_config_json TEXT,
+    result_id INTEGER,
+    error_message TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS quant_backtest_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
+    summary_json TEXT,
+    equity_series_json TEXT,
+    trade_log_json TEXT,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS quant_job_progress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    progress_pct INTEGER NOT NULL,
+    processed_items INTEGER,
+    current_marker TEXT,
+    elapsed_ms INTEGER,
+    ts INTEGER NOT NULL
+  );
 `);
 
 const insertTradeStmt = db.prepare(`
@@ -48,6 +93,42 @@ const insertBookStmt = db.prepare(`
   ) VALUES (
     @symbol, @bid_price, @bid_qty, @ask_price, @ask_qty, @ts
   )
+`);
+
+const insertStrategyStmt = db.prepare(`
+  INSERT INTO quant_strategies (file_name, raw_content, parse_status, metadata_json, parse_message, created_at)
+  VALUES (@file_name, @raw_content, @parse_status, @metadata_json, @parse_message, @created_at)
+`);
+
+const createJobStmt = db.prepare(`
+  INSERT INTO quant_backtest_jobs (
+    strategy_id, status, progress_pct, processed_items, current_marker, run_config_json, created_at, updated_at
+  ) VALUES (
+    @strategy_id, 'queued', 0, 0, 'Queued', @run_config_json, @created_at, @updated_at
+  )
+`);
+
+const updateJobStmt = db.prepare(`
+  UPDATE quant_backtest_jobs
+  SET status = COALESCE(@status, status),
+      progress_pct = COALESCE(@progress_pct, progress_pct),
+      processed_items = COALESCE(@processed_items, processed_items),
+      current_marker = COALESCE(@current_marker, current_marker),
+      elapsed_ms = COALESCE(@elapsed_ms, elapsed_ms),
+      result_id = COALESCE(@result_id, result_id),
+      error_message = COALESCE(@error_message, error_message),
+      updated_at = @updated_at
+  WHERE id = @id
+`);
+
+const insertResultStmt = db.prepare(`
+  INSERT INTO quant_backtest_results (job_id, summary_json, equity_series_json, trade_log_json, created_at)
+  VALUES (@job_id, @summary_json, @equity_series_json, @trade_log_json, @created_at)
+`);
+
+const insertProgressStmt = db.prepare(`
+  INSERT INTO quant_job_progress (job_id, status, progress_pct, processed_items, current_marker, elapsed_ms, ts)
+  VALUES (@job_id, @status, @progress_pct, @processed_items, @current_marker, @elapsed_ms, @ts)
 `);
 
 export function saveTrade(trade) {
@@ -69,12 +150,11 @@ export function getRecentTrades(symbol, limit = 500) {
 }
 
 export function getTradeRange(symbol) {
-  const row = db.prepare(`
+  return db.prepare(`
     SELECT MIN(trade_time) as minTime, MAX(trade_time) as maxTime, COUNT(*) as count
     FROM trades
     WHERE symbol = ?
   `).get(symbol);
-  return row;
 }
 
 export function getTradesByRange(symbol, start, end, limit = 20000) {
@@ -96,4 +176,91 @@ export function getLatestBook(symbol) {
     ORDER BY ts DESC
     LIMIT 1
   `).get(symbol);
+}
+
+export function saveQuantStrategy(record) {
+  const now = Date.now();
+  const info = insertStrategyStmt.run({ ...record, created_at: now });
+  return getQuantStrategyById(info.lastInsertRowid);
+}
+
+export function getQuantStrategyById(id) {
+  return db.prepare('SELECT * FROM quant_strategies WHERE id = ?').get(id);
+}
+
+export function createQuantBacktestJob(record) {
+  const now = Date.now();
+  const info = createJobStmt.run({ ...record, created_at: now, updated_at: now });
+  const job = getQuantBacktestJobById(info.lastInsertRowid);
+  saveQuantJobProgress({
+    job_id: job.id,
+    status: job.status,
+    progress_pct: job.progress_pct,
+    processed_items: job.processed_items,
+    current_marker: job.current_marker,
+    elapsed_ms: job.elapsed_ms || 0
+  });
+  return job;
+}
+
+export function updateQuantBacktestJob(id, patch) {
+  updateJobStmt.run({ id, ...patch, updated_at: Date.now() });
+  const job = getQuantBacktestJobById(id);
+  saveQuantJobProgress({
+    job_id: id,
+    status: job.status,
+    progress_pct: job.progress_pct,
+    processed_items: job.processed_items,
+    current_marker: job.current_marker,
+    elapsed_ms: job.elapsed_ms || 0
+  });
+  return job;
+}
+
+export function completeQuantBacktestJob(id, patch) {
+  return updateQuantBacktestJob(id, { ...patch, status: 'completed' });
+}
+
+export function failQuantBacktestJob(id, errorMessage) {
+  return updateQuantBacktestJob(id, { status: 'failed', error_message: errorMessage, current_marker: 'Failed' });
+}
+
+export function getQuantBacktestJobById(id) {
+  return db.prepare('SELECT * FROM quant_backtest_jobs WHERE id = ?').get(id);
+}
+
+export function listQuantBacktestJobs(limit = 50) {
+  return db.prepare(`
+    SELECT j.*, s.file_name as strategy_file_name, s.metadata_json
+    FROM quant_backtest_jobs j
+    LEFT JOIN quant_strategies s ON s.id = j.strategy_id
+    ORDER BY j.created_at DESC
+    LIMIT ?
+  `).all(limit);
+}
+
+export function saveQuantBacktestResult(record) {
+  const now = Date.now();
+  const info = insertResultStmt.run({ ...record, created_at: now });
+  return getQuantBacktestResultById(info.lastInsertRowid);
+}
+
+export function getQuantBacktestResultById(id) {
+  return db.prepare('SELECT * FROM quant_backtest_results WHERE id = ?').get(id);
+}
+
+export function getQuantResultByJobId(jobId) {
+  return db.prepare('SELECT * FROM quant_backtest_results WHERE job_id = ?').get(jobId);
+}
+
+export function saveQuantJobProgress(record) {
+  insertProgressStmt.run({ ...record, ts: Date.now() });
+}
+
+export function listQuantJobProgress(jobId) {
+  return db.prepare(`
+    SELECT * FROM quant_job_progress
+    WHERE job_id = ?
+    ORDER BY ts ASC
+  `).all(jobId);
 }

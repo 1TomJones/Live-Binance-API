@@ -32,6 +32,7 @@ function TopStatusBarComponent({
       <div className="route-links">
         <a href="/">Live</a>
         <a href="/replay">Replay</a>
+        <a href="/quant">Quant</a>
         {onToggleFullscreen && (
           <button type="button" className="fullscreen-btn" onClick={onToggleFullscreen}>
             {isFullscreen ? '⤢ Exit' : '⤢ Full'}
