@@ -88,11 +88,24 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
     candleSeriesRef.current?.setData(candles);
 
     if (indicators.vwap) {
-      vwapSeriesRef.current?.setData(payload.vwap || []);
+      const vwapSeries = (payload.vwap || []).map(({ time, value }) => ({ time, value }));
+      vwapSeriesRef.current?.setData(vwapSeries);
     }
 
     if (indicators.cvd) {
-      cvdSeriesRef.current?.setData(payload.cvd || []);
+      const cvdCandles = (payload.cvd || []).map(({ time, open, high, low, close }) => ({ time, open, high, low, close }));
+      cvdSeriesRef.current?.setData(cvdCandles);
+    }
+
+    if (import.meta.env.DEV && payload.debug) {
+      console.debug('[session/snapshot]', {
+        timeframe,
+        candles: payload.debug.sessionCandleCount,
+        counts: payload.debug.timeframeCounts,
+        sessionStartIso: payload.sessionStartIso,
+        vwapHasVariance: payload.debug.vwapHasVariance,
+        cvdBarsWithTrades: payload.debug.cvdBarsWithTrades
+      });
     }
 
     if (fit) chartRef.current?.timeScale().fitContent();
@@ -220,6 +233,14 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
         if (!range?.from || !range?.to) return;
         const response = await fetch(`/api/indicators/volume-profile?timeframe=${timeframe}&from=${Math.floor(range.from)}&to=${Math.ceil(range.to)}`);
         const payload = await response.json();
+        if (import.meta.env.DEV) {
+          console.debug('[volume-profile]', {
+            timeframe,
+            from: Math.floor(range.from),
+            to: Math.ceil(range.to),
+            buckets: (payload.profile || []).length
+          });
+        }
         setProfile(payload.profile || []);
       }, 250);
     };

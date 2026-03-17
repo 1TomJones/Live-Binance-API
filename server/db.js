@@ -194,6 +194,16 @@ export function getTradeRange(symbol) {
 }
 
 export function getTradesByRange(symbol, start, end, limit = 20000) {
+  if (limit == null) {
+    return db.prepare(`
+      SELECT trade_id, symbol, price, quantity, trade_time, maker_flag, side, ingest_ts
+      FROM trades
+      WHERE symbol = ?
+        AND trade_time BETWEEN ? AND ?
+      ORDER BY trade_time ASC
+    `).all(symbol, start, end);
+  }
+
   return db.prepare(`
     SELECT trade_id, symbol, price, quantity, trade_time, maker_flag, side, ingest_ts
     FROM trades
