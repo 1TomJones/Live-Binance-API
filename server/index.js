@@ -15,7 +15,6 @@ import {
   getRecentTrades,
   getTradeRange,
   getTradesByRange,
-  getTradesCountByRange,
   listQuantBacktestJobs,
   listQuantJobProgress,
   saveBookTicker,
@@ -23,7 +22,6 @@ import {
   saveQuantLiveRun,
   saveQuantStrategy,
   saveTrade,
-  saveTradesBatch,
   updateQuantBacktestJob,
   getQuantStrategyById
 } from './db.js';
@@ -36,14 +34,14 @@ import { StrategyUploadService, StrategyValidationService } from './quant/strate
 import {
   buildVolumeProfileByDollar,
   computeSessionCvdFromTrades,
-  computeSessionVwapFromTrades,
+  computeSessionVwapFromCandles,
   aggregateCandles,
-  buildCanonicalMinuteCandles,
   getUtcDayStartMs,
 } from './sessionAnalytics.js';
 
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'BTCUSDT';
+const MAX_IN_MEMORY_TRADES = 15000;
 const BINANCE_REST_BASES = [
   process.env.BINANCE_REST_URL,
   'https://api.binance.com/api/v3',
@@ -66,13 +64,15 @@ function createSessionState(dayStartMs) {
     dayStartMs,
     trades: [],
     tradeIds: new Set(),
+    minuteCandles: [],
+    minuteCandleIndex: new Map(),
     hydration: {
       status: 'idle',
       source: null,
       startedAt: null,
       finishedAt: null,
-      fetchedTradeCount: 0,
-      mergedTradeCount: 0,
+      fetchedCandleCount: 0,
+      mergedCandleCount: 0,
       lastError: null
     }
   };
@@ -98,6 +98,13 @@ function insertTradeIntoSession(trade) {
     sessionState.trades.push(trade);
     sessionState.trades.sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
   }
+
+  if (sessionState.trades.length > MAX_IN_MEMORY_TRADES) {
+    const trimmed = sessionState.trades.slice(-MAX_IN_MEMORY_TRADES);
+    sessionState.trades = trimmed;
+    sessionState.tradeIds = new Set(trimmed.map((item) => item.trade_id));
+  }
+
   return true;
 }
 
@@ -129,28 +136,50 @@ function buildTimeScaffold(timeframe, sessionStartMs, nowMs) {
   return scaffold;
 }
 
-function normalizeAggTrade(trade) {
+function normalizeKline(row) {
   return {
-    trade_id: Number(trade.l),
-    symbol: SYMBOL,
-    price: Number(trade.p),
-    quantity: Number(trade.q),
-    trade_time: Number(trade.T),
-    maker_flag: trade.m ? 1 : 0,
-    side: trade.m ? 'sell' : 'buy',
-    ingest_ts: Date.now()
+    time: Math.floor(Number(row[0]) / 1000),
+    open: Number(row[1]),
+    high: Number(row[2]),
+    low: Number(row[3]),
+    close: Number(row[4]),
+    volume: Number(row[5]),
+    hasTrades: Number(row[8] || 0) > 0,
+    isPlaceholder: false
   };
 }
 
-async function backfillCurrentSessionFromBinance(dayStartMs, nowMs) {
+function mergeMinuteCandlesIntoSession(candles = []) {
+  let merged = 0;
+  candles.forEach((candle) => {
+    if (!candle || !Number.isFinite(candle.time) || candle.time < Math.floor(sessionState.dayStartMs / 1000)) return;
+    const existingIndex = sessionState.minuteCandleIndex.get(candle.time);
+    if (existingIndex === undefined) {
+      sessionState.minuteCandleIndex.set(candle.time, sessionState.minuteCandles.length);
+      sessionState.minuteCandles.push(candle);
+      merged += 1;
+      return;
+    }
+
+    sessionState.minuteCandles[existingIndex] = candle;
+  });
+
+  sessionState.minuteCandles.sort((a, b) => a.time - b.time);
+  sessionState.minuteCandleIndex = new Map(sessionState.minuteCandles.map((candle, index) => [candle.time, index]));
+  return merged;
+}
+
+async function backfillCurrentSessionCandlesFromBinance(dayStartMs, nowMs) {
   const collected = [];
+  const nowSec = Math.floor(nowMs / 1000) * 1000;
   let cursor = dayStartMs;
 
-  while (cursor <= nowMs) {
+  while (cursor <= nowSec) {
     const search = new URLSearchParams({
       symbol: SYMBOL,
+      interval: '1m',
       startTime: String(cursor),
-      endTime: String(nowMs),
+      endTime: String(nowSec),
       limit: '1000'
     });
 
@@ -158,7 +187,7 @@ async function backfillCurrentSessionFromBinance(dayStartMs, nowMs) {
     let lastError = null;
 
     for (const baseUrl of BINANCE_REST_BASES) {
-      const url = `${baseUrl}/aggTrades?${search.toString()}`;
+      const url = `${baseUrl}/klines?${search.toString()}`;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
 
@@ -174,18 +203,19 @@ async function backfillCurrentSessionFromBinance(dayStartMs, nowMs) {
     }
 
     if (!response?.ok) {
-      throw new Error(`Unable to backfill aggTrades from Binance endpoints: ${lastError?.message || 'unknown error'}`);
+      throw new Error(`Unable to backfill klines from Binance endpoints: ${lastError?.message || 'unknown error'}`);
     }
 
     const batch = await response.json();
     if (!batch.length) break;
 
-    const normalized = batch.map(normalizeAggTrade);
+    const normalized = batch.map(normalizeKline);
     collected.push(...normalized);
 
-    const lastTs = normalized.at(-1)?.trade_time || cursor;
-    if (lastTs <= cursor) break;
-    cursor = lastTs + 1;
+    const lastOpenMs = Number(batch.at(-1)?.[0] || cursor);
+    const nextCursor = lastOpenMs + 60_000;
+    if (nextCursor <= cursor) break;
+    cursor = nextCursor;
 
   }
 
@@ -200,42 +230,29 @@ async function initializeCurrentSession() {
   sessionState.hydration = {
     ...sessionState.hydration,
     status: 'running',
-    source: 'db+binance-aggTrades',
+    source: 'binance-klines-1m',
     startedAt: Date.now(),
     finishedAt: null,
     lastError: null
   };
 
-  const dbTrades = getTradesByRange(SYMBOL, dayStartMs, nowMs, null);
-  let fetchedTrades = [...dbTrades];
-
-  const presentCount = getTradesCountByRange(SYMBOL, dayStartMs, nowMs);
-  if (presentCount < 5000) {
-    const backfilled = await backfillCurrentSessionFromBinance(dayStartMs, nowMs);
-    saveTradesBatch(backfilled);
-    fetchedTrades = [...fetchedTrades, ...backfilled];
-  }
-
-  const sortedUnique = [...fetchedTrades]
-    .sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id)
-    .filter((trade, index, arr) => index === 0 || trade.trade_id !== arr[index - 1].trade_id);
-
-  const mergedTradeCount = mergeTradesIntoSession(sortedUnique);
+  const backfilledCandles = await backfillCurrentSessionCandlesFromBinance(dayStartMs, nowMs);
+  const mergedCandleCount = mergeMinuteCandlesIntoSession(backfilledCandles);
 
   sessionState.hydration = {
     ...sessionState.hydration,
     status: 'complete',
     finishedAt: Date.now(),
-    fetchedTradeCount: sortedUnique.length,
-    mergedTradeCount,
+    fetchedCandleCount: backfilledCandles.length,
+    mergedCandleCount,
     lastError: null
   };
 
   console.info('[session/hydration] complete', {
     dayStartIso: new Date(dayStartMs).toISOString(),
-    fetchedTradeCount: sortedUnique.length,
-    mergedTradeCount,
-    inMemoryTradeCount: sessionState.trades.length
+    fetchedCandleCount: backfilledCandles.length,
+    mergedCandleCount,
+    inMemoryMinuteCandleCount: sessionState.minuteCandles.length
   });
 }
 
@@ -265,21 +282,13 @@ async function initializeCurrentSessionWithRetries() {
 function buildSessionPayload(timeframe = '1m') {
   ensureCurrentSession();
   const nowMs = Date.now();
-  const minuteCandles = buildCanonicalMinuteCandles(sessionState.trades, {
-    sessionStartMs: sessionState.dayStartMs,
-    nowMs,
-    includeEmptyMinutes: true,
-    carryForwardOnEmpty: false
-  });
+  const minuteCandles = [...sessionState.minuteCandles];
   const hydratedCandles = aggregateCandles(minuteCandles, timeframe);
   const scaffold = buildTimeScaffold(timeframe, sessionState.dayStartMs, nowMs);
   const hydratedByTime = new Map(hydratedCandles.map((bar) => [bar.time, { ...bar, isPlaceholder: false, state: 'hydrated' }]));
   const candles = scaffold.map((slot) => hydratedByTime.get(slot.time) || { ...slot, state: 'placeholder' });
 
-  const vwap = computeSessionVwapFromTrades(sessionState.trades, timeframe, {
-    sessionStartMs: sessionState.dayStartMs,
-    nowMs
-  });
+  const vwap = computeSessionVwapFromCandles(aggregateCandles(minuteCandles, timeframe));
   const cvd = computeSessionCvdFromTrades(sessionState.trades, timeframe, {
     sessionStartMs: sessionState.dayStartMs,
     nowMs
@@ -371,6 +380,10 @@ const stream = new BinanceStreamService({
   onDepth: (depth) => {
     latestDepth = depth;
     io.emit('depth', depth);
+  },
+  onCandle: (candle) => {
+    ensureCurrentSession(candle.time * 1000);
+    mergeMinuteCandlesIntoSession([{ ...candle, hasTrades: true, isPlaceholder: false }]);
   }
 });
 
