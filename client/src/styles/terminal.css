@@ -96,10 +96,75 @@ body { margin: 0; background: #060b13; }
   color: #b9c9e6;
 }
 
-.chart-region { display: flex; flex-direction: column; }
-.chart-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 6px; }
-.chart-title { font-size: 11px; color: #93a8cc; margin: 0 0 5px 4px; letter-spacing: .02em; }
-.tv-chart { flex: 1; border: 1px solid #1a263d; }
+.chart-region { display: flex; flex-direction: column; background: #070d18; }
+.chart-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 6px; gap: 6px; }
+.chart-toolbar {
+  height: 30px;
+  border: 1px solid #1a263d;
+  background: #0b1321;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 8px;
+}
+.chart-title { font-size: 11px; color: #9eb1d6; letter-spacing: .03em; }
+.chart-controls { display: flex; align-items: center; gap: 6px; }
+.timeframe-switcher { display: flex; gap: 2px; }
+.timeframe-switcher button,
+.indicator-menu-btn {
+  background: #0f1a2f;
+  color: #adc0e5;
+  border: 1px solid #243656;
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.timeframe-switcher button.active {
+  color: #dce7fb;
+  border-color: #40639a;
+  background: #182841;
+}
+.indicator-menu-wrap { position: relative; }
+.indicator-menu {
+  position: absolute;
+  right: 0;
+  top: 26px;
+  background: #0e182b;
+  border: 1px solid #243656;
+  min-width: 185px;
+  padding: 6px;
+  display: grid;
+  gap: 4px;
+  z-index: 9;
+}
+.indicator-menu label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: #a8bddf;
+}
+.indicator-menu input { margin: 0; accent-color: #4c74b3; }
+.tv-chart-frame { position: relative; flex: 1; min-height: 0; border: 1px solid #1a263d; }
+.tv-chart { height: 100%; }
+.chart-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.lower-panel {
+  height: 0;
+  overflow: hidden;
+  border: 1px solid transparent;
+  transition: height 120ms ease;
+}
+.lower-panel.visible {
+  height: 160px;
+  border-color: #1a263d;
+}
+.tv-chart.lower { height: 100%; }
 
 .tape-panel { display: flex; flex-direction: column; background: #080f1a; }
 .tape-columns, .tape-row {
