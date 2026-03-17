@@ -87,6 +87,10 @@ const insertTradeStmt = db.prepare(`
   )
 `);
 
+const insertTradesManyStmt = db.transaction((trades) => {
+  for (const trade of trades) insertTradeStmt.run(trade);
+});
+
 const insertBookStmt = db.prepare(`
   INSERT INTO book_ticker (
     symbol, bid_price, bid_qty, ask_price, ask_qty, ts
@@ -133,6 +137,19 @@ const insertProgressStmt = db.prepare(`
 
 export function saveTrade(trade) {
   insertTradeStmt.run(trade);
+}
+
+export function saveTradesBatch(trades) {
+  if (!trades?.length) return;
+  insertTradesManyStmt(trades);
+}
+
+export function getTradesCountByRange(symbol, start, end) {
+  return db.prepare(`
+    SELECT COUNT(*) as count
+    FROM trades
+    WHERE symbol = ? AND trade_time BETWEEN ? AND ?
+  `).get(symbol, start, end)?.count || 0;
 }
 
 export function saveBookTicker(book) {
