@@ -15,26 +15,31 @@ import {
   getRecentTrades,
   getTradeRange,
   getTradesByRange,
+  getTradesCountByRange,
   listQuantBacktestJobs,
   listQuantJobProgress,
   saveBookTicker,
   saveQuantBacktestResult,
   saveQuantStrategy,
   saveTrade,
+  saveTradesBatch,
   updateQuantBacktestJob
 } from './db.js';
 import { BacktestJobService, StrategyExecutionService } from './quant/backtestJobService.js';
 import { LiveStrategyRunner } from './quant/liveMetricsStore.js';
 import { StrategyParserService, StrategyUploadService, StrategyValidationService } from './quant/strategyServices.js';
+import {
+  buildCandlesFromTrades,
+  buildVolumeProfileByDollar,
+  computeSessionCvdFromTrades,
+  computeSessionVwapFromTrades,
+  getUtcDayStartMs,
+  timeframeToSeconds
+} from './sessionAnalytics.js';
 
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'BTCUSDT';
-const TIMEFRAME_TO_SECONDS = {
-  '1m': 60,
-  '5m': 300,
-  '15m': 900,
-  '1h': 3600
-};
+const BINANCE_REST = 'https://api.binance.com/api/v3';
 
 const app = express();
 const server = http.createServer(app);
@@ -46,7 +51,105 @@ app.use(express.json({ limit: '2mb' }));
 let latestTrade = null;
 let latestBook = null;
 let latestDepth = null;
-let candles = [];
+let sessionState = {
+  dayStartMs: getUtcDayStartMs(),
+  trades: [],
+  tradeIds: new Set()
+};
+
+function ensureCurrentSession(nowMs = Date.now()) {
+  const currentDayStart = getUtcDayStartMs(nowMs);
+  if (sessionState.dayStartMs !== currentDayStart) {
+    sessionState = { dayStartMs: currentDayStart, trades: [], tradeIds: new Set() };
+  }
+}
+
+function normalizeAggTrade(trade) {
+  return {
+    trade_id: Number(trade.l),
+    symbol: SYMBOL,
+    price: Number(trade.p),
+    quantity: Number(trade.q),
+    trade_time: Number(trade.T),
+    maker_flag: trade.m ? 1 : 0,
+    side: trade.m ? 'sell' : 'buy',
+    ingest_ts: Date.now()
+  };
+}
+
+async function backfillCurrentSessionFromBinance(dayStartMs, nowMs) {
+  const collected = [];
+  let cursor = dayStartMs;
+
+  while (cursor <= nowMs) {
+    const url = `${BINANCE_REST}/aggTrades?symbol=${SYMBOL}&startTime=${cursor}&endTime=${nowMs}&limit=1000`;
+    const response = await fetch(url);
+    if (!response.ok) break;
+
+    const batch = await response.json();
+    if (!batch.length) break;
+
+    const normalized = batch.map(normalizeAggTrade);
+    collected.push(...normalized);
+
+    const lastTs = normalized.at(-1)?.trade_time || cursor;
+    if (lastTs <= cursor) break;
+    cursor = lastTs + 1;
+
+    if (collected.length > 300000) break;
+  }
+
+  return collected;
+}
+
+async function initializeCurrentSession() {
+  const nowMs = Date.now();
+  const dayStartMs = getUtcDayStartMs(nowMs);
+
+  const dbTrades = getTradesByRange(SYMBOL, dayStartMs, nowMs, 350000);
+  let sessionTrades = dbTrades;
+
+  const presentCount = getTradesCountByRange(SYMBOL, dayStartMs, nowMs);
+  if (presentCount < 5000) {
+    const backfilled = await backfillCurrentSessionFromBinance(dayStartMs, nowMs);
+    saveTradesBatch(backfilled);
+    sessionTrades = [...dbTrades, ...backfilled];
+  }
+
+  const sortedUnique = [...sessionTrades]
+    .sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id)
+    .filter((trade, index, arr) => index === 0 || trade.trade_id !== arr[index - 1].trade_id);
+
+  sessionState = {
+    dayStartMs,
+    trades: sortedUnique,
+    tradeIds: new Set(sortedUnique.map((trade) => trade.trade_id))
+  };
+}
+
+function buildSessionPayload(timeframe = '1m') {
+  ensureCurrentSession();
+  const candles = buildCandlesFromTrades(sessionState.trades, timeframe);
+  const vwap = computeSessionVwapFromTrades(sessionState.trades, timeframe);
+  const cvd = computeSessionCvdFromTrades(sessionState.trades, timeframe);
+
+  return {
+    symbol: SYMBOL,
+    timeframe,
+    sessionStartMs: sessionState.dayStartMs,
+    sessionStartIso: new Date(sessionState.dayStartMs).toISOString(),
+    candles,
+    vwap,
+    cvd,
+    debug: {
+      sessionTradeCount: sessionState.trades.length,
+      sessionCandleCount: candles.length,
+      startsAtUtcMidnight: sessionState.dayStartMs === getUtcDayStartMs(),
+      vwapCurrent: vwap.at(-1)?.value || null,
+      cvdCurrent: cvd.at(-1)?.close || null
+    }
+  };
+}
 
 const strategyUploadService = new StrategyUploadService({
   validationService: new StrategyValidationService(),
@@ -67,83 +170,19 @@ const backtestJobService = new BacktestJobService({
 
 const liveStrategyRunner = new LiveStrategyRunner();
 
-function aggregateCandles(sourceCandles, timeframe = '1m') {
-  const bucketSeconds = TIMEFRAME_TO_SECONDS[timeframe] || TIMEFRAME_TO_SECONDS['1m'];
-  if (bucketSeconds === 60) {
-    return sourceCandles.map((c) => ({ ...c, volume: Number(c.volume || 0) }));
-  }
-
-  const buckets = new Map();
-  sourceCandles.forEach((c) => {
-    const bucketTime = Math.floor(c.time / bucketSeconds) * bucketSeconds;
-    const existing = buckets.get(bucketTime);
-    if (!existing) {
-      buckets.set(bucketTime, {
-        time: bucketTime,
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-        volume: Number(c.volume || 0)
-      });
-      return;
-    }
-
-    existing.high = Math.max(existing.high, c.high);
-    existing.low = Math.min(existing.low, c.low);
-    existing.close = c.close;
-    existing.volume += Number(c.volume || 0);
-  });
-
-  return [...buckets.values()].sort((a, b) => a.time - b.time);
-}
-
-function computeSessionVwap(candleData) {
-  const sessionState = new Map();
-
-  return candleData.map((candle) => {
-    const candleDate = new Date(candle.time * 1000);
-    const sessionKey = `${candleDate.getUTCFullYear()}-${candleDate.getUTCMonth()}-${candleDate.getUTCDate()}`;
-    const state = sessionState.get(sessionKey) || { pv: 0, volume: 0 };
-    const typicalPrice = (candle.high + candle.low + candle.close) / 3;
-    const volume = Number(candle.volume || 0);
-
-    state.pv += typicalPrice * volume;
-    state.volume += volume;
-    sessionState.set(sessionKey, state);
-
-    return {
-      time: candle.time,
-      value: state.volume > 0 ? state.pv / state.volume : candle.close
-    };
-  });
-}
-
-function computeVolumeProfileByDollar(trades) {
-  if (!trades.length) return [];
-
-  const buckets = new Map();
-  trades.forEach((trade) => {
-    const bucketPrice = Math.floor(Number(trade.price));
-    const volume = Number(trade.quantity || 0);
-    buckets.set(bucketPrice, (buckets.get(bucketPrice) || 0) + volume);
-  });
-
-  const sorted = [...buckets.entries()].sort((a, b) => a[0] - b[0]);
-  const maxVolume = Math.max(...sorted.map(([, volume]) => volume), 1);
-
-  return sorted.map(([price, volume]) => ({
-    price,
-    volume,
-    ratio: volume / maxVolume
-  }));
-}
-
 const stream = new BinanceStreamService({
   symbol: SYMBOL,
   onTrade: (trade) => {
     latestTrade = trade;
     saveTrade(trade);
+    ensureCurrentSession(trade.trade_time);
+
+    if (!sessionState.tradeIds.has(trade.trade_id) && trade.trade_time >= sessionState.dayStartMs) {
+      sessionState.tradeIds.add(trade.trade_id);
+      sessionState.trades.push(trade);
+      sessionState.trades.sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
+    }
+
     io.emit('trade', trade);
   },
   onBookTicker: (book) => {
@@ -154,19 +193,10 @@ const stream = new BinanceStreamService({
   onDepth: (depth) => {
     latestDepth = depth;
     io.emit('depth', depth);
-  },
-  onCandleBootstrap: (initialCandles) => {
-    candles = initialCandles.slice(-1200);
-  },
-  onCandle: (candle) => {
-    const idx = candles.findIndex((c) => c.time === candle.time);
-    if (idx >= 0) candles[idx] = candle;
-    else candles.push(candle);
-    candles = candles.slice(-1200);
-    io.emit('candle', candle);
   }
 });
 
+await initializeCurrentSession();
 stream.start();
 
 io.on('connection', (socket) => {
@@ -177,7 +207,7 @@ io.on('connection', (socket) => {
     latestTrade: latestTrade || recent.at(-1) || null,
     latestBook: latestBook || getLatestBook(SYMBOL) || null,
     depth: latestDepth,
-    candles
+    sessionStartMs: sessionState.dayStartMs
   });
 });
 
@@ -188,9 +218,7 @@ app.get('/api/health', (_req, res) => {
 app.post('/api/quant/strategy/upload', (req, res) => {
   const { fileName, content } = req.body || {};
   const result = strategyUploadService.handleUpload({ fileName, content });
-  if (result.status === 'invalid') {
-    return res.status(400).json(result);
-  }
+  if (result.status === 'invalid') return res.status(400).json(result);
   return res.json(result);
 });
 
@@ -236,18 +264,28 @@ app.post('/api/quant/live-metrics', (req, res) => {
   return res.json({ metrics: liveStrategyRunner.update(req.body || {}) });
 });
 
+app.get('/api/session/snapshot', (req, res) => {
+  const timeframe = req.query.timeframe || '1m';
+  return res.json(buildSessionPayload(timeframe));
+});
+
 app.get('/api/candles', (req, res) => {
   const timeframe = req.query.timeframe || '1m';
-  const limit = Math.min(Number(req.query.limit || 400), 1200);
-  const aggregated = aggregateCandles(candles, timeframe).slice(-limit);
-  res.json({ symbol: SYMBOL, timeframe, candles: aggregated });
+  const limit = Math.min(Number(req.query.limit || 1440), 2000);
+  const payload = buildSessionPayload(timeframe);
+  return res.json({ symbol: SYMBOL, timeframe, candles: payload.candles.slice(-limit), sessionStartMs: payload.sessionStartMs });
 });
 
 app.get('/api/indicators/vwap', (req, res) => {
   const timeframe = req.query.timeframe || '1m';
-  const limit = Math.min(Number(req.query.limit || 400), 1200);
-  const series = computeSessionVwap(aggregateCandles(candles, timeframe).slice(-limit));
-  res.json({ symbol: SYMBOL, timeframe, series });
+  const payload = buildSessionPayload(timeframe);
+  return res.json({ symbol: SYMBOL, timeframe, series: payload.vwap, sessionStartMs: payload.sessionStartMs });
+});
+
+app.get('/api/indicators/cvd', (req, res) => {
+  const timeframe = req.query.timeframe || '1m';
+  const payload = buildSessionPayload(timeframe);
+  return res.json({ symbol: SYMBOL, timeframe, candles: payload.cvd, sessionStartMs: payload.sessionStartMs });
 });
 
 app.get('/api/indicators/volume-profile', (req, res) => {
@@ -259,12 +297,27 @@ app.get('/api/indicators/volume-profile', (req, res) => {
     return res.status(400).json({ error: 'from and to are required unix seconds' });
   }
 
-  const tfSec = TIMEFRAME_TO_SECONDS[timeframe] || TIMEFRAME_TO_SECONDS['1m'];
-  const alignedStart = Math.floor(from / tfSec) * tfSec * 1000;
-  const alignedEnd = (Math.floor(to / tfSec) * tfSec + tfSec) * 1000 - 1;
-  const trades = getTradesByRange(SYMBOL, alignedStart, alignedEnd, 200000);
-  const profile = computeVolumeProfileByDollar(trades);
+  ensureCurrentSession();
+  const tfSec = timeframeToSeconds(timeframe);
+  const alignedStartMs = Math.floor(from / tfSec) * tfSec * 1000;
+  const alignedEndMs = (Math.floor(to / tfSec) * tfSec + tfSec) * 1000 - 1;
+  const trades = sessionState.trades.filter((trade) => trade.trade_time >= alignedStartMs && trade.trade_time <= alignedEndMs);
+  const profile = buildVolumeProfileByDollar(trades);
   return res.json({ symbol: SYMBOL, timeframe, from, to, profile });
+});
+
+app.get('/api/session/debug', (_req, res) => {
+  const snapshot = buildSessionPayload('1m');
+  return res.json({
+    symbol: SYMBOL,
+    sessionStartMs: snapshot.sessionStartMs,
+    sessionStartIso: snapshot.sessionStartIso,
+    sessionTradeCount: snapshot.debug.sessionTradeCount,
+    sessionCandleCount1m: snapshot.debug.sessionCandleCount,
+    startsAtUtcMidnight: snapshot.debug.startsAtUtcMidnight,
+    latestVwap: snapshot.debug.vwapCurrent,
+    latestCvd: snapshot.debug.cvdCurrent
+  });
 });
 
 app.get('/api/history/range', (_req, res) => {
