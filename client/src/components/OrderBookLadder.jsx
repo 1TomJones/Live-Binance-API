@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { memo, useMemo } from 'react';
 
 function fmtPrice(v) {
   return Number(v).toFixed(2);
@@ -8,7 +8,7 @@ function fmtQty(v) {
   return Number(v).toFixed(4);
 }
 
-export function OrderBookLadder({ depth }) {
+function OrderBookLadderComponent({ depth }) {
   const asks = depth?.asks || [];
   const bids = depth?.bids || [];
 
@@ -48,3 +48,5 @@ export function OrderBookLadder({ depth }) {
     </aside>
   );
 }
+
+export const OrderBookLadder = memo(OrderBookLadderComponent);

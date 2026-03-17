@@ -1,6 +1,6 @@
-import React from 'react';
+import React, { memo } from 'react';
 
-export function TopStatusBar({
+function TopStatusBarComponent({
   mode,
   symbol = 'BTCUSDT',
   lastPrice,
@@ -41,3 +41,5 @@ export function TopStatusBar({
     </header>
   );
 }
+
+export const TopStatusBar = memo(TopStatusBarComponent);

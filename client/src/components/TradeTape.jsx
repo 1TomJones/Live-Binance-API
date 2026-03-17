@@ -1,11 +1,11 @@
-import React from 'react';
+import React, { memo } from 'react';
 
 function fmtTime(ts) {
   const d = new Date(ts);
   return `${d.toLocaleTimeString()}.${String(d.getMilliseconds()).padStart(3, '0')}`;
 }
 
-export function TradeTape({ trades }) {
+function TradeTapeComponent({ trades }) {
   return (
     <aside className="tape-panel">
       <div className="pane-title">LIVE TRADE TAPE</div>
@@ -30,3 +30,5 @@ export function TradeTape({ trades }) {
     </aside>
   );
 }
+
+export const TradeTape = memo(TradeTapeComponent);
