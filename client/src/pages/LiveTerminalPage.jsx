@@ -11,7 +11,6 @@ export function LiveTerminalPage() {
   const [trades, setTrades] = useState([]);
   const [book, setBook] = useState(null);
   const [depth, setDepth] = useState(null);
-  const [candles, setCandles] = useState([]);
   const [connected, setConnected] = useState(socket.connected);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const rootRef = useRef(null);
@@ -24,7 +23,6 @@ export function LiveTerminalPage() {
       setTrades(payload.trades || []);
       setBook(payload.latestBook || null);
       setDepth(payload.depth || null);
-      setCandles(payload.candles || []);
     });
 
     socket.on('trade', (trade) => {
@@ -37,18 +35,6 @@ export function LiveTerminalPage() {
 
     socket.on('depth', (nextDepth) => {
       setDepth(nextDepth);
-    });
-
-    socket.on('candle', (nextCandle) => {
-      setCandles((prev) => {
-        const idx = prev.findIndex((c) => c.time === nextCandle.time);
-        if (idx >= 0) {
-          const clone = [...prev];
-          clone[idx] = nextCandle;
-          return clone;
-        }
-        return [...prev, nextCandle].slice(-500);
-      });
     });
 
     const onFullscreenChange = () => {
@@ -64,7 +50,6 @@ export function LiveTerminalPage() {
       socket.off('trade');
       socket.off('bookTicker');
       socket.off('depth');
-      socket.off('candle');
       document.removeEventListener('fullscreenchange', onFullscreenChange);
     };
   }, []);
@@ -108,11 +93,11 @@ export function LiveTerminalPage() {
       <section className="terminal-main">
         <OrderBookLadder depth={depth} />
         <div className="chart-region">
-          <CandlestickChart candles={candles} />
+          <CandlestickChart symbol="BTCUSDT" depth={depth} />
         </div>
         <TradeTape trades={trades} />
       </section>
-      <footer className="terminal-footer">Binance streams: BTCUSDT@depth@100ms · @trade · @kline_1m</footer>
+      <footer className="terminal-footer">Binance streams: BTCUSDT@depth@100ms · @trade · @kline_1m · multi-timeframe + order-flow indicators</footer>
     </main>
   );
 }
