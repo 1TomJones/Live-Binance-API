@@ -25,6 +25,8 @@ app.use(express.json());
 
 let latestTrade = null;
 let latestBook = null;
+let latestDepth = null;
+let candles = [];
 
 const stream = new BinanceStreamService({
   symbol: SYMBOL,
@@ -37,18 +39,34 @@ const stream = new BinanceStreamService({
     latestBook = book;
     saveBookTicker(book);
     io.emit('bookTicker', book);
+  },
+  onDepth: (depth) => {
+    latestDepth = depth;
+    io.emit('depth', depth);
+  },
+  onCandleBootstrap: (initialCandles) => {
+    candles = initialCandles.slice(-400);
+  },
+  onCandle: (candle) => {
+    const idx = candles.findIndex((c) => c.time === candle.time);
+    if (idx >= 0) candles[idx] = candle;
+    else candles.push(candle);
+    candles = candles.slice(-400);
+    io.emit('candle', candle);
   }
 });
 
 stream.start();
 
 io.on('connection', (socket) => {
-  const recent = getRecentTrades(SYMBOL, 300).reverse();
+  const recent = getRecentTrades(SYMBOL, 500).reverse();
   socket.emit('bootstrap', {
     symbol: SYMBOL,
     trades: recent,
     latestTrade: latestTrade || recent.at(-1) || null,
-    latestBook: latestBook || getLatestBook(SYMBOL) || null
+    latestBook: latestBook || getLatestBook(SYMBOL) || null,
+    depth: latestDepth,
+    candles
   });
 });
 
