@@ -1,13 +1,14 @@
 import React from 'react';
 
 function fmtTime(ts) {
-  return new Date(ts).toLocaleTimeString();
+  const d = new Date(ts);
+  return `${d.toLocaleTimeString()}.${String(d.getMilliseconds()).padStart(3, '0')}`;
 }
 
 export function TradeTape({ trades }) {
   return (
     <aside className="tape-panel">
-      <div className="tape-header">LIVE TRADE FLOW</div>
+      <div className="pane-title">LIVE TRADE TAPE</div>
       <div className="tape-columns">
         <span>Time</span><span>ID</span><span>Price</span><span>Qty</span><span>Notional</span><span>Side</span>
       </div>
