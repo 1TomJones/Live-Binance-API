@@ -67,6 +67,16 @@ db.exec(`
     created_at INTEGER NOT NULL
   );
 
+
+
+  CREATE TABLE IF NOT EXISTS quant_live_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id INTEGER NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS quant_job_progress (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id INTEGER NOT NULL,
@@ -133,6 +143,15 @@ const insertResultStmt = db.prepare(`
 const insertProgressStmt = db.prepare(`
   INSERT INTO quant_job_progress (job_id, status, progress_pct, processed_items, current_marker, elapsed_ms, ts)
   VALUES (@job_id, @status, @progress_pct, @processed_items, @current_marker, @elapsed_ms, @ts)
+`);
+
+const upsertLiveRunStmt = db.prepare(`
+  INSERT INTO quant_live_runs (strategy_id, status, state_json, updated_at)
+  VALUES (@strategy_id, @status, @state_json, @updated_at)
+  ON CONFLICT(strategy_id) DO UPDATE SET
+    status = excluded.status,
+    state_json = excluded.state_json,
+    updated_at = excluded.updated_at
 `);
 
 export function saveTrade(trade) {
@@ -280,4 +299,14 @@ export function listQuantJobProgress(jobId) {
     WHERE job_id = ?
     ORDER BY ts ASC
   `).all(jobId);
+}
+
+
+export function saveQuantLiveRun({ strategyId, status, stateJson }) {
+  upsertLiveRunStmt.run({ strategy_id: strategyId, status, state_json: stateJson, updated_at: Date.now() });
+  return getQuantLiveRun(strategyId);
+}
+
+export function getQuantLiveRun(strategyId) {
+  return db.prepare('SELECT * FROM quant_live_runs WHERE strategy_id = ?').get(strategyId);
 }
