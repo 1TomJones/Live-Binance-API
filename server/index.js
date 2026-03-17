@@ -66,98 +66,44 @@ function aggregateCandles(sourceCandles, timeframe = '1m') {
   return [...buckets.values()].sort((a, b) => a.time - b.time);
 }
 
-function computeVwap(candleData) {
-  let cumulativePV = 0;
-  let cumulativeVolume = 0;
+function computeSessionVwap(candleData) {
+  const sessionState = new Map();
 
   return candleData.map((candle) => {
+    const candleDate = new Date(candle.time * 1000);
+    const sessionKey = `${candleDate.getUTCFullYear()}-${candleDate.getUTCMonth()}-${candleDate.getUTCDate()}`;
+    const state = sessionState.get(sessionKey) || { pv: 0, volume: 0 };
     const typicalPrice = (candle.high + candle.low + candle.close) / 3;
     const volume = Number(candle.volume || 0);
-    cumulativePV += typicalPrice * volume;
-    cumulativeVolume += volume;
+
+    state.pv += typicalPrice * volume;
+    state.volume += volume;
+    sessionState.set(sessionKey, state);
+
     return {
       time: candle.time,
-      value: cumulativeVolume > 0 ? cumulativePV / cumulativeVolume : candle.close
+      value: state.volume > 0 ? state.pv / state.volume : candle.close
     };
   });
 }
 
-function computeCvd(trades, timeframe = '1m') {
-  const bucketMs = (TIMEFRAME_TO_SECONDS[timeframe] || 60) * 1000;
-  const grouped = new Map();
-
-  trades.forEach((trade) => {
-    const bucket = Math.floor(trade.trade_time / bucketMs) * bucketMs;
-    const delta = trade.maker_flag ? -Number(trade.quantity) : Number(trade.quantity);
-    grouped.set(bucket, (grouped.get(bucket) || 0) + delta);
-  });
-
-  let cumulative = 0;
-  return [...grouped.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([bucket, delta]) => {
-      cumulative += delta;
-      return {
-        time: Math.floor(bucket / 1000),
-        delta,
-        value: cumulative
-      };
-    });
-}
-
-function computeImbalanceSnapshot(depth, levels = 10) {
-  if (!depth?.bids?.length || !depth?.asks?.length) return null;
-
-  const bids = depth.bids.slice(0, levels);
-  const asks = depth.asks.slice(0, levels);
-  const bidVolume = bids.reduce((sum, level) => sum + Number(level.quantity || 0), 0);
-  const askVolume = asks.reduce((sum, level) => sum + Number(level.quantity || 0), 0);
-  const total = bidVolume + askVolume;
-
-  return {
-    ts: depth.ts,
-    levels,
-    bidVolume,
-    askVolume,
-    value: total > 0 ? (bidVolume - askVolume) / total : 0
-  };
-}
-
-function computeVolumeProfile(trades, bins = 24) {
+function computeVolumeProfileByDollar(trades) {
   if (!trades.length) return [];
 
-  const min = Math.min(...trades.map((t) => t.price));
-  const max = Math.max(...trades.map((t) => t.price));
-  const span = Math.max(max - min, 0.01);
-  const binSize = span / bins;
-  const volumes = Array.from({ length: bins }, () => 0);
-
+  const buckets = new Map();
   trades.forEach((trade) => {
-    const idx = Math.min(Math.floor((trade.price - min) / binSize), bins - 1);
-    volumes[Math.max(0, idx)] += Number(trade.quantity || 0);
+    const bucketPrice = Math.floor(Number(trade.price));
+    const volume = Number(trade.quantity || 0);
+    buckets.set(bucketPrice, (buckets.get(bucketPrice) || 0) + volume);
   });
 
-  const maxVol = Math.max(...volumes, 1);
-  return volumes.map((volume, idx) => ({
-    priceStart: min + idx * binSize,
-    priceEnd: min + (idx + 1) * binSize,
+  const sorted = [...buckets.entries()].sort((a, b) => a[0] - b[0]);
+  const maxVolume = Math.max(...sorted.map(([, volume]) => volume), 1);
+
+  return sorted.map(([price, volume]) => ({
+    price,
     volume,
-    ratio: volume / maxVol
-  }));
-}
-
-function computeLiquidityHeatmap(depth, levels = 50) {
-  if (!depth?.bids?.length || !depth?.asks?.length) return [];
-
-  const allLevels = [
-    ...depth.bids.slice(0, levels).map((row) => ({ side: 'bid', price: row.price, quantity: row.quantity })),
-    ...depth.asks.slice(0, levels).map((row) => ({ side: 'ask', price: row.price, quantity: row.quantity }))
-  ];
-
-  const maxQty = Math.max(...allLevels.map((row) => Number(row.quantity || 0)), 1);
-  return allLevels.map((row) => ({
-    ...row,
-    intensity: Number(row.quantity || 0) / maxQty
+    ratio: volume / maxVolume
   }));
 }
 
@@ -217,34 +163,25 @@ app.get('/api/candles', (req, res) => {
 app.get('/api/indicators/vwap', (req, res) => {
   const timeframe = req.query.timeframe || '1m';
   const limit = Math.min(Number(req.query.limit || 400), 1200);
-  const series = computeVwap(aggregateCandles(candles, timeframe).slice(-limit));
+  const series = computeSessionVwap(aggregateCandles(candles, timeframe).slice(-limit));
   res.json({ symbol: SYMBOL, timeframe, series });
-});
-
-app.get('/api/indicators/cvd', (req, res) => {
-  const timeframe = req.query.timeframe || '1m';
-  const trades = getRecentTrades(SYMBOL, 12000).reverse();
-  const series = computeCvd(trades, timeframe).slice(-600);
-  res.json({ symbol: SYMBOL, timeframe, series });
-});
-
-app.get('/api/indicators/imbalance', (req, res) => {
-  const levels = Math.min(Math.max(Number(req.query.levels || 10), 1), 50);
-  const snapshot = computeImbalanceSnapshot(latestDepth, levels);
-  res.json({ symbol: SYMBOL, snapshot });
 });
 
 app.get('/api/indicators/volume-profile', (req, res) => {
-  const bins = Math.min(Math.max(Number(req.query.bins || 24), 12), 80);
-  const trades = getRecentTrades(SYMBOL, 6000);
-  const profile = computeVolumeProfile(trades, bins);
-  res.json({ symbol: SYMBOL, bins, profile });
-});
+  const timeframe = req.query.timeframe || '1m';
+  const from = Number(req.query.from);
+  const to = Number(req.query.to);
 
-app.get('/api/indicators/liquidity-heatmap', (req, res) => {
-  const levels = Math.min(Math.max(Number(req.query.levels || 40), 5), 100);
-  const heatmap = computeLiquidityHeatmap(latestDepth, levels);
-  res.json({ symbol: SYMBOL, levels, heatmap });
+  if (!Number.isFinite(from) || !Number.isFinite(to)) {
+    return res.status(400).json({ error: 'from and to are required unix seconds' });
+  }
+
+  const tfSec = TIMEFRAME_TO_SECONDS[timeframe] || TIMEFRAME_TO_SECONDS['1m'];
+  const alignedStart = Math.floor(from / tfSec) * tfSec * 1000;
+  const alignedEnd = (Math.floor(to / tfSec) * tfSec + tfSec) * 1000 - 1;
+  const trades = getTradesByRange(SYMBOL, alignedStart, alignedEnd, 200000);
+  const profile = computeVolumeProfileByDollar(trades);
+  return res.json({ symbol: SYMBOL, timeframe, from, to, profile });
 });
 
 app.get('/api/history/range', (_req, res) => {
