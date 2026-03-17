@@ -48,6 +48,13 @@ const BINANCE_REST_BASES = [
   'https://data-api.binance.vision/api/v3'
 ].filter(Boolean);
 
+class NonRetryableInitializationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'NonRetryableInitializationError';
+  }
+}
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
@@ -146,62 +153,98 @@ function normalizeAggTrade(trade) {
   };
 }
 
+async function fetchBinanceWithFallback(endpointPath, search, { timeoutMs = 10000, context = 'binance-request' } = {}) {
+  const params = Object.fromEntries(search.entries());
+  let lastFailure = null;
+
+  for (const baseUrl of BINANCE_REST_BASES) {
+    const url = `${baseUrl}${endpointPath}?${search.toString()}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      if (!response.ok) {
+        const responseBody = await response.text();
+        const failure = {
+          status: response.status,
+          url,
+          baseUrl,
+          endpointPath,
+          params,
+          responseBody
+        };
+
+        console.error(`[${context}] non-200 response from Binance`, failure);
+        lastFailure = failure;
+
+        if (response.status >= 400 && response.status < 500) {
+          const message = responseBody || `HTTP ${response.status}`;
+          throw new NonRetryableInitializationError(
+            `Binance ${endpointPath} request rejected (HTTP ${response.status}): ${message}`
+          );
+        }
+
+        continue;
+      }
+
+      const payload = await response.json();
+      return { payload, url, baseUrl };
+    } catch (error) {
+      if (error instanceof NonRetryableInitializationError) {
+        throw error;
+      }
+
+      lastFailure = {
+        url,
+        baseUrl,
+        endpointPath,
+        params,
+        error: error?.message || String(error)
+      };
+      console.error(`[${context}] request failed`, lastFailure);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw new Error(
+    `Unable to fetch ${endpointPath} from Binance endpoints: ${JSON.stringify(lastFailure)}`
+  );
+}
+
 async function backfillCurrentSessionTradesFromBinance(dayStartMs, nowMs) {
   let processed = 0;
   let fetched = 0;
-  let cursorTradeId = null;
+  let cursorStartTime = dayStartMs;
 
   while (true) {
     const search = new URLSearchParams({
       symbol: SYMBOL,
-      limit: '1000',
-      endTime: String(nowMs)
+      limit: '1000'
     });
 
-    if (cursorTradeId === null) {
-      search.set('startTime', String(dayStartMs));
-    } else {
-      search.set('fromId', String(cursorTradeId));
-    }
+    search.set('startTime', String(cursorStartTime));
+    search.set('endTime', String(nowMs));
 
-    let response = null;
-    let lastError = null;
-
-    for (const baseUrl of BINANCE_REST_BASES) {
-      const url = `${baseUrl}/aggTrades?${search.toString()}`;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10000);
-
-      try {
-        response = await fetch(url, { signal: controller.signal });
-        if (response.ok) break;
-        lastError = new Error(`HTTP ${response.status} from ${baseUrl}`);
-      } catch (error) {
-        lastError = error;
-      } finally {
-        clearTimeout(timeout);
-      }
-    }
-
-    if (!response?.ok) {
-      throw new Error(`Unable to backfill aggTrades from Binance endpoints: ${lastError?.message || 'unknown error'}`);
-    }
-
-    const batch = await response.json();
+    const { payload: batch } = await fetchBinanceWithFallback('/aggTrades', search, {
+      context: 'session/hydration/aggTrades'
+    });
     if (!batch.length) break;
 
     fetched += batch.length;
+    let highestTradeTime = cursorStartTime;
+
     for (const item of batch) {
       const trade = normalizeAggTrade(item);
       if (trade.trade_time < dayStartMs || trade.trade_time > nowMs) continue;
       if (applyTradeToDerivedState(trade)) processed += 1;
+      highestTradeTime = Math.max(highestTradeTime, trade.trade_time);
     }
 
-    const lastTradeId = Number(batch.at(-1)?.a);
-    if (!Number.isFinite(lastTradeId)) break;
-    cursorTradeId = lastTradeId + 1;
-
-    if (batch.length < 1000) break;
+    const nextCursor = highestTradeTime + 1;
+    if (nextCursor <= cursorStartTime || nextCursor > nowMs) break;
+    cursorStartTime = nextCursor;
   }
 
   return { fetched, processed };
@@ -274,30 +317,9 @@ async function backfillCurrentSessionCandlesFromBinance(dayStartMs, nowMs) {
       limit: '1000'
     });
 
-    let response = null;
-    let lastError = null;
-
-    for (const baseUrl of BINANCE_REST_BASES) {
-      const url = `${baseUrl}/klines?${search.toString()}`;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10000);
-
-      try {
-        response = await fetch(url, { signal: controller.signal });
-        if (response.ok) break;
-        lastError = new Error(`HTTP ${response.status} from ${baseUrl}`);
-      } catch (error) {
-        lastError = error;
-      } finally {
-        clearTimeout(timeout);
-      }
-    }
-
-    if (!response?.ok) {
-      throw new Error(`Unable to backfill klines from Binance endpoints: ${lastError?.message || 'unknown error'}`);
-    }
-
-    const batch = await response.json();
+    const { payload: batch } = await fetchBinanceWithFallback('/klines', search, {
+      context: 'session/hydration/klines'
+    });
     if (!batch.length) break;
 
     const normalized = batch.map(normalizeKline);
@@ -329,17 +351,28 @@ async function initializeCurrentSession() {
 
   const backfilledCandles = await backfillCurrentSessionCandlesFromBinance(dayStartMs, nowMs);
   const mergedCandleCount = mergeMinuteCandlesIntoSession(backfilledCandles);
-  const tradeBackfill = await backfillCurrentSessionTradesFromBinance(dayStartMs, nowMs);
+  let tradeBackfill = { fetched: 0, processed: 0 };
+  let tradeBackfillError = null;
+
+  try {
+    tradeBackfill = await backfillCurrentSessionTradesFromBinance(dayStartMs, nowMs);
+  } catch (error) {
+    tradeBackfillError = error;
+    console.error('[session/hydration] aggTrades backfill failed; continuing with candle hydration only', {
+      dayStartIso: new Date(dayStartMs).toISOString(),
+      error: error?.message || String(error)
+    });
+  }
 
   sessionState.hydration = {
     ...sessionState.hydration,
-    status: 'complete',
+    status: tradeBackfillError ? 'complete_with_warnings' : 'complete',
     finishedAt: Date.now(),
     fetchedCandleCount: backfilledCandles.length,
     fetchedTradeCount: tradeBackfill.fetched,
     mergedCandleCount,
     processedTradeCount: tradeBackfill.processed,
-    lastError: null
+    lastError: tradeBackfillError ? (tradeBackfillError?.message || String(tradeBackfillError)) : null
   };
 
   console.info('[session/hydration] complete', {
@@ -348,7 +381,8 @@ async function initializeCurrentSession() {
     fetchedTradeCount: tradeBackfill.fetched,
     mergedCandleCount,
     processedTradeCount: tradeBackfill.processed,
-    inMemoryMinuteCandleCount: sessionState.minuteCandles.length
+    inMemoryMinuteCandleCount: sessionState.minuteCandles.length,
+    tradeBackfillWarning: tradeBackfillError ? (tradeBackfillError?.message || String(tradeBackfillError)) : null
   });
 }
 
@@ -362,6 +396,17 @@ async function initializeCurrentSessionWithRetries() {
       console.log(`Current session initialized (attempt ${attempt}).`);
       return;
     } catch (error) {
+      if (error instanceof NonRetryableInitializationError) {
+        sessionState.hydration = {
+          ...sessionState.hydration,
+          status: 'failed',
+          finishedAt: Date.now(),
+          lastError: error?.message || String(error)
+        };
+        console.error('Session initialization aborted due to non-retryable error.', error);
+        throw error;
+      }
+
       sessionState.hydration = {
         ...sessionState.hydration,
         status: 'failed',
