@@ -1,4 +1,5 @@
 import React, { memo, useMemo, useState } from 'react';
+import { UI_LIMITS } from '../constants/uiPerformance.js';
 
 function fmtPrice(v) {
   return Number(v).toFixed(2);
@@ -19,7 +20,7 @@ function buildAggregatedBands(depth) {
     return { asks: [], bids: [] };
   }
 
-  const bandsPerSide = 35;
+  const bandsPerSide = UI_LIMITS.orderBookLevelsPerSide;
   const askStart = Math.floor(bestAsk);
   const bidStart = Math.floor(bestBid);
 
@@ -48,6 +49,41 @@ function buildAggregatedBands(depth) {
   return { asks, bids };
 }
 
+const OrderBookRow = memo(function OrderBookRow({ side, level, maxSize }) {
+  const quantity = Number(level.quantity || 0);
+  return (
+    <div className={`book-row ${side}`}>
+      <span className="depth-bg" style={{ width: `${(quantity / maxSize) * 100}%` }} />
+      <span className="price">{fmtPrice(level.price)}</span>
+      <span>{fmtQty(quantity)}</span>
+      <span>{fmtNotional(level.price * quantity)}</span>
+    </div>
+  );
+}, (prev, next) => prev.side === next.side
+  && prev.maxSize === next.maxSize
+  && prev.level.price === next.level.price
+  && prev.level.quantity === next.level.quantity);
+
+function summarizeDisplay(display) {
+  let maxSize = 1;
+  let totalVisibleAsks = 0;
+  let totalVisibleBids = 0;
+
+  display.asks.forEach((level) => {
+    const qty = Number(level.quantity || 0);
+    totalVisibleAsks += qty;
+    if (qty > maxSize) maxSize = qty;
+  });
+
+  display.bids.forEach((level) => {
+    const qty = Number(level.quantity || 0);
+    totalVisibleBids += qty;
+    if (qty > maxSize) maxSize = qty;
+  });
+
+  return { maxSize, totalVisibleAsks, totalVisibleBids };
+}
+
 function OrderBookLadderComponent({ depth }) {
   const [mode, setMode] = useState('raw');
   const asks = depth?.asks || [];
@@ -56,27 +92,19 @@ function OrderBookLadderComponent({ depth }) {
   const display = useMemo(() => {
     if (mode === 'raw') {
       return {
-        asks: asks.slice(0, 35),
-        bids: bids.slice(0, 35)
+        asks: asks.slice(0, UI_LIMITS.orderBookLevelsPerSide),
+        bids: bids.slice(0, UI_LIMITS.orderBookLevelsPerSide)
       };
     }
     return buildAggregatedBands(depth);
   }, [mode, asks, bids, depth]);
 
-  const maxSize = useMemo(() => {
-    const values = [...display.asks, ...display.bids].map((level) => Number(level.quantity || 0));
-    return Math.max(...values, 1);
-  }, [display]);
-
-  const totalVisibleAsks = useMemo(
-    () => display.asks.reduce((sum, level) => sum + Number(level.quantity || 0), 0),
-    [display.asks]
+  const { maxSize, totalVisibleAsks, totalVisibleBids } = useMemo(
+    () => summarizeDisplay(display),
+    [display]
   );
 
-  const totalVisibleBids = useMemo(
-    () => display.bids.reduce((sum, level) => sum + Number(level.quantity || 0), 0),
-    [display.bids]
-  );
+  const reversedAsks = useMemo(() => display.asks.slice().reverse(), [display.asks]);
 
   return (
     <aside className="book-panel">
@@ -91,13 +119,8 @@ function OrderBookLadderComponent({ depth }) {
       </div>
       <div className="book-columns"><span>Price</span><span>Size</span><span>Notional</span></div>
       <div className="book-scroll">
-        {display.asks.slice().reverse().map((level) => (
-          <div key={`a-${level.price}`} className="book-row ask">
-            <span className="depth-bg" style={{ width: `${(Number(level.quantity || 0) / maxSize) * 100}%` }} />
-            <span className="price">{fmtPrice(level.price)}</span>
-            <span>{fmtQty(level.quantity)}</span>
-            <span>{fmtNotional(level.price * level.quantity)}</span>
-          </div>
+        {reversedAsks.map((level) => (
+          <OrderBookRow key={`a-${level.price}`} side="ask" level={level} maxSize={maxSize} />
         ))}
         <div className="spread-row">
           <span>Spread</span>
@@ -105,12 +128,7 @@ function OrderBookLadderComponent({ depth }) {
           <span>{depth?.bestBid && depth?.bestAsk ? `${fmtPrice(depth.bestBid.price)} / ${fmtPrice(depth.bestAsk.price)}` : '--'}</span>
         </div>
         {display.bids.map((level) => (
-          <div key={`b-${level.price}`} className="book-row bid">
-            <span className="depth-bg" style={{ width: `${(Number(level.quantity || 0) / maxSize) * 100}%` }} />
-            <span className="price">{fmtPrice(level.price)}</span>
-            <span>{fmtQty(level.quantity)}</span>
-            <span>{fmtNotional(level.price * level.quantity)}</span>
-          </div>
+          <OrderBookRow key={`b-${level.price}`} side="bid" level={level} maxSize={maxSize} />
         ))}
       </div>
     </aside>

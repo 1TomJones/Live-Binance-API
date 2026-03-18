@@ -1,12 +1,15 @@
 export const UI_REFRESH_INTERVALS_MS = {
-  tradeTape: 50,
-  orderBook: 100,
-  stats: 100,
+  tradeTape: 80,
+  orderBook: 120,
+  stats: 200,
+  chartSnapshot: 320,
+  volumeProfile: 900,
   chartOverlay: 100
 };
 
 export const UI_LIMITS = {
-  visibleTradeRows: 250,
-  tradeBufferLimit: 1200,
-  statsWindowSize: 5000
+  visibleTradeRows: 180,
+  tradeBufferLimit: 1400,
+  statsWindowSize: 5000,
+  orderBookLevelsPerSide: 35
 };
