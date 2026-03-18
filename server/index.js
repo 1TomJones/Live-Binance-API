@@ -38,7 +38,7 @@ import {
   aggregateCandles,
   getUtcDayStartMs,
 } from './sessionAnalytics.js';
-import { buildSessionReplay } from './quant/sessionReplayBuilder.js';
+import { buildReplayEnvironment } from './quant/replayEnvironment.js';
 
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'BTCUSDT';
@@ -120,29 +120,6 @@ function ensureCvdMinuteCandle(minuteTimeSec) {
   sessionState.cvdMinuteIndex.set(minuteTimeSec, sessionState.cvdMinuteCandles.length);
   sessionState.cvdMinuteCandles.push(candle);
   return candle;
-}
-
-function mergeCvdMinuteCandlesIntoSession(candles = []) {
-  let merged = 0;
-
-  candles.forEach((candle) => {
-    if (!candle || !Number.isFinite(candle.time) || candle.time < Math.floor(sessionState.dayStartMs / 1000)) return;
-
-    const existingIndex = sessionState.cvdMinuteIndex.get(candle.time);
-    if (existingIndex === undefined) {
-      sessionState.cvdMinuteIndex.set(candle.time, sessionState.cvdMinuteCandles.length);
-      sessionState.cvdMinuteCandles.push(candle);
-      merged += 1;
-      return;
-    }
-
-    sessionState.cvdMinuteCandles[existingIndex] = candle;
-  });
-
-  sessionState.cvdMinuteCandles.sort((a, b) => a.time - b.time);
-  sessionState.cvdMinuteIndex = new Map(sessionState.cvdMinuteCandles.map((candle, index) => [candle.time, index]));
-  sessionState.cvdRunning = sessionState.cvdMinuteCandles.at(-1)?.close || 0;
-  return merged;
 }
 
 function getTradeCandleTimeSec(tradeTimeMs, candleIntervalSec = 60) {
@@ -304,37 +281,6 @@ function normalizeKline(row) {
   };
 }
 
-function buildCvdMinuteCandlesFromKlines(klines = []) {
-  const result = [];
-  let running = 0;
-
-  klines
-    .sort((a, b) => a.time - b.time)
-    .forEach((kline) => {
-      const totalVolume = Number(kline.volume || 0);
-      const buyVolume = Number(kline.takerBuyBaseVolume || 0);
-      const sellVolume = Math.max(0, totalVolume - buyVolume);
-      const delta = buyVolume - sellVolume;
-
-      const candle = {
-        time: kline.time,
-        open: running,
-        high: running,
-        low: running,
-        close: running,
-        hasTrades: Boolean(kline.hasTrades)
-      };
-
-      running += delta;
-      candle.high = Math.max(candle.high, running);
-      candle.low = Math.min(candle.low, running);
-      candle.close = running;
-      result.push(candle);
-    });
-
-  return result;
-}
-
 function mergeMinuteCandlesIntoSession(candles = []) {
   let merged = 0;
   candles.forEach((candle) => {
@@ -404,7 +350,6 @@ async function initializeCurrentSession() {
   console.info('Starting candle backfill', { dayStartIso: new Date(dayStartMs).toISOString() });
   const backfilledCandles = await backfillCurrentSessionCandlesFromBinance(dayStartMs, nowMs);
   const mergedCandleCount = mergeMinuteCandlesIntoSession(backfilledCandles);
-  const mergedCvdCount = mergeCvdMinuteCandlesIntoSession(buildCvdMinuteCandlesFromKlines(backfilledCandles));
   sessionState.volumeProfile = new Map(
     buildVolumeProfileFromCandles(backfilledCandles).map(({ price, volume }) => [price, volume])
   );
@@ -428,7 +373,6 @@ async function initializeCurrentSession() {
     fetchedCandleCount: backfilledCandles.length,
     fetchedTradeCount: 0,
     mergedCandleCount,
-    mergedCvdCount,
     processedTradeCount: sessionState.hydration.processedTradeCount,
     inMemoryMinuteCandleCount: sessionState.minuteCandles.length,
     inMemoryCvdMinuteCandleCount: sessionState.cvdMinuteCandles.length,
@@ -459,16 +403,8 @@ async function initializeCurrentSessionSafe() {
 }
 
 function buildSessionPayload(timeframe = '1m') {
-  ensureCurrentSession();
   const nowMs = Date.now();
-  const minuteCandles = [...sessionState.minuteCandles];
-  const replay = buildSessionReplay({
-    timeframe,
-    sessionStartMs: sessionState.dayStartMs,
-    nowMs,
-    minuteCandles,
-    cvdMinuteCandles: sessionState.cvdMinuteCandles
-  });
+  const { replay, trades: sessionTrades, minuteCandles } = buildLiveReplayEnvironment({ timeframe, nowMs });
 
   const timeframeCounts = ['1m', '5m', '15m', '1h'].reduce((acc, tf) => {
     acc[tf] = aggregateCandles(minuteCandles, tf).length;
@@ -489,6 +425,7 @@ function buildSessionPayload(timeframe = '1m') {
     cvd: replay.cvd,
     debug: {
       sessionTradeCount: sessionState.hydration.processedTradeCount,
+      replayTradeCount: sessionTrades.length,
       sessionCandleCount: replay.candles.length,
       hydratedCandleCount: hydratedCount,
       placeholderCandleCount: placeholderCount,
@@ -597,16 +534,10 @@ const backtestJobService = new BacktestJobService({
 });
 
 function buildLiveMarketSnapshot() {
-  ensureCurrentSession();
-  const replay = buildSessionReplay({
-    timeframe: '1m',
-    sessionStartMs: sessionState.dayStartMs,
-    nowMs: Date.now(),
-    minuteCandles: sessionState.minuteCandles,
-    cvdMinuteCandles: sessionState.cvdMinuteCandles
-  });
+  const nowMs = Date.now();
+  const { replay } = buildLiveReplayEnvironment({ timeframe: '1m', nowMs });
 
-  const nowMinuteSec = Math.floor(Date.now() / 60000) * 60;
+  const nowMinuteSec = Math.floor(nowMs / 60000) * 60;
   const candles = replay.engineCandles;
   const closedCandles = candles.filter((candle) => candle.time < nowMinuteSec);
   const markPrice = Number(latestTrade?.price || latestBook?.bidPrice || latestBook?.askPrice || candles.at(-1)?.close || 0) || null;
@@ -622,6 +553,22 @@ function buildLiveMarketSnapshot() {
       closedCandles
     }
   };
+}
+
+function buildLiveReplayEnvironment({ timeframe = '1m', replayMode = 'live', nowMs = Date.now() } = {}) {
+  ensureCurrentSession(nowMs);
+  const trades = getTradesByRange(SYMBOL, sessionState.dayStartMs, nowMs, null);
+
+  return buildReplayEnvironment({
+    timeframe,
+    replayMode,
+    sessionStartMs: sessionState.dayStartMs,
+    nowMs,
+    input: {
+      mode: 'trades',
+      trades
+    }
+  });
 }
 
 const liveStrategyRunner = new LivePaperRunner({

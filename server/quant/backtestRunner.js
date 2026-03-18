@@ -1,4 +1,4 @@
-import { buildSessionReplay } from './sessionReplayBuilder.js';
+import { buildReplayEnvironment } from './replayEnvironment.js';
 import { buildHistoricalClosedCandleReplay, runClosedCandleReplay } from './replayOrchestrator.js';
 
 export class BacktestRunner {
@@ -24,14 +24,18 @@ export class BacktestRunner {
         endMs: dayEndMs,
         limit: null
       });
-      const closedCandles = buildSessionReplay({
+      const { replay } = buildReplayEnvironment({
         replayMode: 'backtest',
         timeframe: strategy.market.timeframe,
         sessionStartMs: dayStartMs,
         nowMs: dayEndMs,
-        trades: dayTrades,
+        input: {
+          mode: 'trades',
+          trades: dayTrades
+        },
         settings: runState.settings
-      }).closedEngineCandles;
+      });
+      const closedCandles = replay.closedEngineCandles;
       const { pendingCandles } = buildHistoricalClosedCandleReplay({
         state: runState,
         closedCandles
