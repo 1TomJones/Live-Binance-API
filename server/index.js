@@ -705,7 +705,9 @@ app.get('/api/indicators/volume-profile', (req, res) => {
   const timeframe = req.query.timeframe || '1m';
 
   ensureCurrentSession();
-  const profile = buildVolumeProfileFromMap(sessionState.volumeProfile);
+  const profile = sessionState.volumeProfile.size
+    ? buildVolumeProfileFromMap(sessionState.volumeProfile)
+    : buildVolumeProfileFromCandles(sessionState.minuteCandles);
   return res.json({
     symbol: SYMBOL,
     timeframe,

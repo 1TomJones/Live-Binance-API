@@ -47,7 +47,6 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [indicators, setIndicators] = useState(defaultIndicators);
   const [profile, setProfile] = useState([]);
-  const [profileRects, setProfileRects] = useState([]);
 
   const showLowerPanel = indicators.cvd;
 
@@ -70,19 +69,43 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
 
     canvas.width = 0;
     canvas.height = 0;
-    setProfileRects([]);
+    canvas.style.width = '0px';
+    canvas.style.height = '0px';
+  }, []);
+
+  const getVolumeProfilePaneBounds = useCallback(() => {
+    const chart = chartRef.current;
+    const frame = chartFrameRef.current;
+    if (!chart || !frame) return null;
+
+    const rightPriceScaleWidth = Math.max(Math.round(chart.priceScale('right')?.width?.() || 0), 0);
+    const timeScaleHeight = Math.max(Math.round(chart.timeScale()?.height?.() || 0), 0);
+    const width = Math.max(frame.clientWidth - rightPriceScaleWidth, 0);
+    const height = Math.max(frame.clientHeight - timeScaleHeight, 0);
+
+    return {
+      left: 0,
+      top: 0,
+      width,
+      height
+    };
   }, []);
 
   const drawVolumeProfile = useCallback(() => {
     const series = candleSeriesRef.current;
     const canvas = overlayCanvasRef.current;
-    const frame = chartFrameRef.current;
-    const width = frame?.clientWidth || 0;
-    const height = frame?.clientHeight || 0;
+    const paneBounds = getVolumeProfilePaneBounds();
     const activeIndicators = indicatorsRef.current;
     const activeProfile = profileRef.current;
+    const width = paneBounds?.width || 0;
+    const height = paneBounds?.height || 0;
 
     if (!canvas || !width || !height) return;
+
+    canvas.style.left = `${paneBounds.left}px`;
+    canvas.style.top = `${paneBounds.top}px`;
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
 
     const pixelRatio = window.devicePixelRatio || 1;
     canvas.width = Math.floor(width * pixelRatio);
@@ -95,13 +118,11 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
     ctx.clearRect(0, 0, width, height);
 
     if (!activeIndicators.volumeProfile || !series || !activeProfile.length) {
-      setProfileRects([]);
       return;
     }
 
     const rightPadding = 8;
-    const maxBarWidth = Math.max(width * 0.1, 40);
-    const nextRects = [];
+    const maxBarWidth = width * 0.1;
 
     activeProfile.forEach((bucket) => {
       const topCoord = series.priceToCoordinate(bucket.price + 1);
@@ -114,20 +135,10 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
       const barWidth = Math.max(bucket.ratio * maxBarWidth, 1);
       const left = width - rightPadding - barWidth;
 
-      nextRects.push({
-        price: bucket.price,
-        left,
-        top,
-        width: barWidth,
-        height: barHeight
-      });
-
       ctx.fillStyle = 'rgba(125, 173, 255, 0.5)';
       ctx.fillRect(left, top, barWidth, barHeight);
     });
-
-    setProfileRects(nextRects);
-  }, []);
+  }, [getVolumeProfilePaneBounds]);
 
   const refreshVolumeProfile = useCallback(async () => {
     if (!indicators.volumeProfile) {
@@ -331,20 +342,6 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
       <div ref={chartFrameRef} className="tv-chart-frame">
         <div ref={containerRef} className="tv-chart" />
         <canvas ref={overlayCanvasRef} className="chart-overlay" />
-        <div className="volume-profile-overlay" aria-hidden="true">
-          {profileRects.map((bar) => (
-            <div
-              key={bar.price}
-              className="volume-profile-bar"
-              style={{
-                left: `${bar.left}px`,
-                top: `${bar.top}px`,
-                width: `${bar.width}px`,
-                height: `${bar.height}px`
-              }}
-            />
-          ))}
-        </div>
       </div>
 
       <div className={`lower-panel ${showLowerPanel ? 'visible' : ''}`}>
