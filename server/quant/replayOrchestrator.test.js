@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fixture from './__fixtures__/marketReplayParity.json' with { type: 'json' };
 import { getBuiltInStrategyDefinition } from './builtinStrategies.js';
 import { BacktestRunner } from './backtestRunner.js';
-import { buildSessionReplay, REPLAY_EXECUTION_MODES } from './sessionReplayBuilder.js';
+import { buildSessionReplay, REPLAY_EXECUTION_MODES, buildCvdMinuteCandlesFromTrades, buildTradeBucketMap } from './sessionReplayBuilder.js';
+import { buildCanonicalMinuteCandles } from '../sessionAnalytics.js';
 import {
   buildHistoricalClosedCandleReplay,
   buildLiveClosedCandleReplay,
@@ -45,7 +46,7 @@ test('live replay evaluates only newly closed candles while preserving the prior
   assert.deepStrictEqual(replay.pendingCandles.map((candle) => candle.time), [220]);
 });
 
-test('backtest runner defaults to live-parity execution mode and emits entry debug output from the parity feed', () => {
+test('backtest runner defaults to live-parity execution mode and emits entry debug output from the parity feed', async () => {
   const { trades, sessionStartMs } = fixture;
   const strategy = getBuiltInStrategyDefinition('VWAP_CVD_Live_Trend_01').strategy;
   const dayEndMs = sessionStartMs + 86400000 - 1;
@@ -63,10 +64,16 @@ test('backtest runner defaults to live-parity execution mode and emits entry deb
   }).closedEngineCandles;
   const runner = new BacktestRunner({
     executionEngine: new StrategyExecutionEngine(),
-    loadTrades: ({ startMs, endMs }) => trades.filter((trade) => trade.trade_time >= startMs && trade.trade_time <= endMs)
+    loadMarketData: async ({ startMs, endMs }) => ({
+      input: {
+        mode: 'trades',
+        trades: trades.filter((trade) => trade.trade_time >= startMs && trade.trade_time <= endMs)
+      },
+      source: 'fixture_trades'
+    })
   });
 
-  const result = runner.run({
+  const result = await runner.run({
     strategy,
     runConfig: {
       startDate: new Date(sessionStartMs).toISOString().slice(0, 10),
@@ -91,6 +98,35 @@ test('backtest runner defaults to live-parity execution mode and emits entry deb
       shortSignal: expectedReplay[1].close < expectedReplay[1].vwap_session && expectedReplay[1].cvd_close < expectedReplay[1].prev_cvd_close
     }
   );
+});
+
+test('backtest runner can execute from canonical candles when historical trades are unavailable', async () => {
+  const { trades, sessionStartMs } = fixture;
+  const strategy = getBuiltInStrategyDefinition('VWAP_CVD_Live_Trend_01').strategy;
+  const dayLabel = new Date(sessionStartMs).toISOString().slice(0, 10);
+  const minuteCandles = buildCanonicalMinuteCandles(trades, { sessionStartMs, nowMs: sessionStartMs + 86400000 - 1, includeEmptyMinutes: true });
+  const cvdMinuteCandles = buildCvdMinuteCandlesFromTrades(trades, { sessionStartMs, nowMs: sessionStartMs + 86400000 - 1 });
+  const byBucket = buildTradeBucketMap(trades, '1m', { sessionStartMs, nowMs: sessionStartMs + 86400000 - 1 });
+
+  const runner = new BacktestRunner({
+    executionEngine: new StrategyExecutionEngine(),
+    loadMarketData: async () => ({
+      input: { mode: 'canonical', minuteCandles, cvdMinuteCandles, byBucket },
+      source: 'fixture_canonical'
+    })
+  });
+
+  const result = await runner.run({
+    strategy,
+    runConfig: {
+      startDate: dayLabel,
+      endDate: dayLabel
+    }
+  });
+
+  assert.ok(result.dayResults[0].inputCandleCount > 0);
+  assert.equal(result.dayResults[0].source, 'fixture_canonical');
+  assert.ok(result.candleDebugLog.length > 0);
 });
 
 test('live-parity backtest and incremental live replay stay aligned on entry and exit timestamps', () => {
