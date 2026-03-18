@@ -10,7 +10,7 @@ test('shared replay environment keeps canonical live inputs and trade-driven bac
   const minuteCandles = buildCanonicalMinuteCandles(trades, {
     sessionStartMs,
     nowMs,
-    includeEmptyMinutes: false
+    includeEmptyMinutes: true
   });
   const cvdMinuteCandles = buildCvdMinuteCandlesFromTrades(trades, { sessionStartMs, nowMs });
 
@@ -39,7 +39,7 @@ test('shared replay environment keeps canonical live inputs and trade-driven bac
 
   assert.deepStrictEqual(
     normalizeParitySeries(liveStyleEnvironment.replay.engineCandles),
-    normalizeParitySeries(backtestEnvironment.replay.closedEngineCandles)
+    normalizeParitySeries(backtestEnvironment.replay.engineCandles)
   );
 });
 

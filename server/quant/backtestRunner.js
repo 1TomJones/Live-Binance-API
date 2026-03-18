@@ -1,5 +1,6 @@
 import { buildReplayEnvironment } from './replayEnvironment.js';
 import { buildHistoricalClosedCandleReplay, runClosedCandleReplay } from './replayOrchestrator.js';
+import { REPLAY_EXECUTION_MODES } from './sessionReplayBuilder.js';
 
 export class BacktestRunner {
   constructor({ executionEngine, loadTrades }) {
@@ -15,6 +16,7 @@ export class BacktestRunner {
     const totalUnits = totalDays * 1000;
     const dayResults = [];
     const candleDebugLog = [];
+    const executionMode = normalizeReplayExecutionMode(runConfig.executionMode);
 
     forEachUtcDay(startDate, endDate, ({ dayStartMs, dayEndMs, isoDate, dayIndex }) => {
       shouldStop?.();
@@ -26,6 +28,7 @@ export class BacktestRunner {
       });
       const { replay } = buildReplayEnvironment({
         replayMode: 'backtest',
+        executionMode,
         timeframe: strategy.market.timeframe,
         sessionStartMs: dayStartMs,
         nowMs: dayEndMs,
@@ -111,9 +114,16 @@ export class BacktestRunner {
       ...result,
       dayResults,
       candleDebugLog,
-      replaySpeed: Number(runConfig.replaySpeed || 1)
+      replaySpeed: Number(runConfig.replaySpeed || 1),
+      executionMode
     };
   }
+}
+
+function normalizeReplayExecutionMode(value) {
+  return value === REPLAY_EXECUTION_MODES.TRADE_ONLY
+    ? REPLAY_EXECUTION_MODES.TRADE_ONLY
+    : REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY;
 }
 
 function normalizeDay(value) {

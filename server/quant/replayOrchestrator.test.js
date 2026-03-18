@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fixture from './__fixtures__/marketReplayParity.json' with { type: 'json' };
 import { getBuiltInStrategyDefinition } from './builtinStrategies.js';
 import { BacktestRunner } from './backtestRunner.js';
-import { buildSessionReplay } from './sessionReplayBuilder.js';
+import { buildSessionReplay, REPLAY_EXECUTION_MODES } from './sessionReplayBuilder.js';
 import {
   buildHistoricalClosedCandleReplay,
   buildLiveClosedCandleReplay,
@@ -45,14 +45,16 @@ test('live replay evaluates only newly closed candles while preserving the prior
   assert.deepStrictEqual(replay.pendingCandles.map((candle) => candle.time), [220]);
 });
 
-test('backtest runner replays candles through the shared execution loop and emits entry debug output', () => {
-  const { trades, sessionStartMs, nowMs } = fixture;
+test('backtest runner defaults to live-parity execution mode and emits entry debug output from the parity feed', () => {
+  const { trades, sessionStartMs } = fixture;
   const strategy = getBuiltInStrategyDefinition('VWAP_CVD_Live_Trend_01').strategy;
+  const dayEndMs = sessionStartMs + 86400000 - 1;
   const expectedReplay = buildSessionReplay({
     replayMode: 'backtest',
+    executionMode: REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY,
     timeframe: strategy.market.timeframe,
     sessionStartMs,
-    nowMs,
+    nowMs: dayEndMs,
     trades,
     settings: {
       stopLossPct: strategy.risk.stop_loss_pct,
@@ -74,6 +76,7 @@ test('backtest runner replays candles through the shared execution loop and emit
   });
 
   assert.equal(result.replaySpeed, 48);
+  assert.equal(result.executionMode, REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY);
   assert.equal(result.candleDebugLog.length, Math.max(expectedReplay.length - 1, 0));
   assert.deepStrictEqual(
     result.candleDebugLog[0],
@@ -87,6 +90,74 @@ test('backtest runner replays candles through the shared execution loop and emit
       longSignal: expectedReplay[1].close > expectedReplay[1].vwap_session && expectedReplay[1].cvd_close > expectedReplay[1].prev_cvd_close,
       shortSignal: expectedReplay[1].close < expectedReplay[1].vwap_session && expectedReplay[1].cvd_close < expectedReplay[1].prev_cvd_close
     }
+  );
+});
+
+test('live-parity backtest and incremental live replay stay aligned on entry and exit timestamps', () => {
+  const { trades, sessionStartMs } = fixture;
+  const strategy = getBuiltInStrategyDefinition('VWAP_CVD_Live_Trend_01').strategy;
+  const dayEndMs = sessionStartMs + 86400000 - 1;
+  const executionEngine = new StrategyExecutionEngine();
+  const settings = {
+    stopLossPct: strategy.risk.stop_loss_pct,
+    takeProfitPct: strategy.risk.take_profit_pct
+  };
+  const closedCandles = buildSessionReplay({
+    replayMode: 'backtest',
+    executionMode: REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY,
+    timeframe: strategy.market.timeframe,
+    sessionStartMs,
+    nowMs: dayEndMs,
+    trades,
+    settings
+  }).closedEngineCandles;
+
+  const historicalState = executionEngine.createRunState({ strategy, runConfig: settings });
+  const liveState = executionEngine.createRunState({ strategy, runConfig: settings });
+  const historicalFillModel = executionEngine.createFillModel({ syntheticSpreadBps: historicalState.settings.syntheticSpreadBps });
+  const liveFillModel = executionEngine.createFillModel({ syntheticSpreadBps: liveState.settings.syntheticSpreadBps });
+
+  const { pendingCandles } = buildHistoricalClosedCandleReplay({
+    state: historicalState,
+    closedCandles
+  });
+  runClosedCandleReplay({
+    strategy,
+    state: historicalState,
+    candles: pendingCandles,
+    executionEngine,
+    fillModel: historicalFillModel,
+    currentDateLabel: new Date(sessionStartMs).toISOString().slice(0, 10),
+    finalizeSession: true
+  });
+
+  closedCandles.forEach((_candle, index) => {
+    const replay = buildLiveClosedCandleReplay({
+      state: liveState,
+      closedCandles: closedCandles.slice(0, index + 1)
+    });
+
+    runClosedCandleReplay({
+      strategy,
+      state: liveState,
+      candles: replay.pendingCandles,
+      executionEngine,
+      fillModel: liveFillModel,
+      currentDateLabel: new Date(sessionStartMs).toISOString().slice(0, 10),
+      finalizeSession: false
+    });
+  });
+
+  executionEngine.finalizeDay({
+    strategy,
+    state: liveState,
+    fillModel: liveFillModel,
+    dateLabel: new Date(sessionStartMs).toISOString().slice(0, 10)
+  });
+
+  assert.deepStrictEqual(
+    summarizeTrades(liveState.trades),
+    summarizeTrades(historicalState.trades)
   );
 });
 
@@ -144,3 +215,13 @@ test('shared replay loop keeps end-of-day flattening in the common execution pat
   assert.equal(endOfDayClose?.exitReason, 'end_of_day_exit');
   assert.equal(state.position, null);
 });
+
+function summarizeTrades(trades = []) {
+  return trades.map((trade) => ({
+    side: trade.side,
+    entryTime: trade.entryTime,
+    entryCandleTime: trade.entryCandleTime,
+    exitTime: trade.exitTime,
+    exitReason: trade.exitReason
+  }));
+}

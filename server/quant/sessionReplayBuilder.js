@@ -5,9 +5,15 @@ import {
   timeframeToSeconds
 } from '../sessionAnalytics.js';
 
+export const REPLAY_EXECUTION_MODES = {
+  STRICT_LIVE_PARITY: 'strict_live_parity',
+  TRADE_ONLY: 'trade_only'
+};
+
 export function buildSessionReplay({
   timeframe = '1m',
   replayMode = 'live',
+  executionMode,
   sessionStartMs,
   nowMs = Date.now(),
   trades = [],
@@ -16,12 +22,13 @@ export function buildSessionReplay({
   byBucket,
   settings = {}
 } = {}) {
+  const resolvedExecutionMode = normalizeExecutionMode(executionMode);
   const resolvedMinuteCandles = normalizeMinuteCandles(
     minuteCandles
     ?? buildCanonicalMinuteCandles(trades, {
       sessionStartMs,
       nowMs,
-      includeEmptyMinutes: false
+      includeEmptyMinutes: resolvedExecutionMode === REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY
     })
   );
 
@@ -41,16 +48,16 @@ export function buildSessionReplay({
   const resolvedBuckets = byBucket ?? buildTradeBucketMap(trades, timeframe, { sessionStartMs, nowMs });
   const vwapByTime = new Map(vwap.map((point) => [point.time, point.value]));
   const cvdByTime = new Map(cvd.map((point) => [point.time, point]));
+  const paritySourceCandles = candles.filter((candle) => !candle.isPlaceholder && Number.isFinite(candle.open) && Number.isFinite(candle.close));
+  const tradeOnlySourceCandles = hydratedCandles;
   const closedEngineCandles = enrichReplayCandles(
-    hydratedCandles,
+    resolvedExecutionMode === REPLAY_EXECUTION_MODES.TRADE_ONLY ? tradeOnlySourceCandles : paritySourceCandles,
     { vwapByTime, cvdByTime, byBucket: resolvedBuckets, settings }
   );
   const engineSourceCandles = replayMode === 'backtest'
-    ? hydratedCandles
-    : candles.filter((candle) => !candle.isPlaceholder && Number.isFinite(candle.open) && Number.isFinite(candle.close));
-  const engineCandles = replayMode === 'backtest'
     ? closedEngineCandles
-    : enrichReplayCandles(engineSourceCandles, { vwapByTime, cvdByTime, byBucket: resolvedBuckets, settings });
+    : enrichReplayCandles(paritySourceCandles, { vwapByTime, cvdByTime, byBucket: resolvedBuckets, settings });
+  const engineCandles = replayMode === 'backtest' ? closedEngineCandles : engineSourceCandles;
 
   return {
     candles,
@@ -59,9 +66,16 @@ export function buildSessionReplay({
     vwap,
     cvd,
     byBucket: resolvedBuckets,
+    executionMode: resolvedExecutionMode,
     engineCandles,
     closedEngineCandles
   };
+}
+
+function normalizeExecutionMode(executionMode) {
+  return executionMode === REPLAY_EXECUTION_MODES.TRADE_ONLY
+    ? REPLAY_EXECUTION_MODES.TRADE_ONLY
+    : REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY;
 }
 
 export function buildTimeScaffold(timeframe, sessionStartMs, nowMs) {

@@ -2,7 +2,8 @@ import { buildCanonicalMinuteCandles } from '../sessionAnalytics.js';
 import {
   buildCvdMinuteCandlesFromTrades,
   buildSessionReplay,
-  buildTradeBucketMap
+  buildTradeBucketMap,
+  REPLAY_EXECUTION_MODES
 } from './sessionReplayBuilder.js';
 
 export function buildReplayEnvironment({
@@ -10,6 +11,7 @@ export function buildReplayEnvironment({
   replayMode = 'live',
   sessionStartMs,
   nowMs = Date.now(),
+  executionMode,
   input,
   trades,
   minuteCandles,
@@ -27,7 +29,8 @@ export function buildReplayEnvironment({
     candleHydration,
     sessionStartMs,
     nowMs,
-    timeframe
+    timeframe,
+    executionMode
   });
 
   return {
@@ -35,6 +38,7 @@ export function buildReplayEnvironment({
     replay: buildSessionReplay({
       timeframe,
       replayMode,
+      executionMode,
       sessionStartMs,
       nowMs,
       minuteCandles: resolvedInput.minuteCandles,
@@ -54,7 +58,8 @@ export function resolveReplayInput({
   candleHydration,
   sessionStartMs,
   nowMs = Date.now(),
-  timeframe = '1m'
+  timeframe = '1m',
+  executionMode
 } = {}) {
   const source = input || inferReplayInputSource({ trades, minuteCandles, cvdMinuteCandles, byBucket, candleHydration });
 
@@ -71,11 +76,14 @@ export function resolveReplayInput({
 
   if (source.mode === 'trades') {
     const resolvedTrades = Array.isArray(source.trades) ? source.trades : [];
+    const resolvedExecutionMode = executionMode === REPLAY_EXECUTION_MODES.TRADE_ONLY
+      ? REPLAY_EXECUTION_MODES.TRADE_ONLY
+      : REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY;
     const resolvedCandleHydration = source.candleHydration || {};
     const resolvedMinuteCandles = buildCanonicalMinuteCandles(resolvedTrades, {
       sessionStartMs,
       nowMs,
-      includeEmptyMinutes: resolvedCandleHydration.includeEmptyMinutes ?? false,
+      includeEmptyMinutes: resolvedCandleHydration.includeEmptyMinutes ?? (resolvedExecutionMode === REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY),
       carryForwardOnEmpty: resolvedCandleHydration.carryForwardOnEmpty ?? true
     });
 
