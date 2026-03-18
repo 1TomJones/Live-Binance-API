@@ -1,6 +1,6 @@
 # Kent Invest Crypto Tape Terminal
 
-A unified full-stack BTCUSDT tape terminal with live Binance trade flow, trade-driven charting, and historical replay.
+A unified full-stack BTCUSDT tape terminal with live Binance trade flow, trade-driven charting, and quant strategy workflows.
 
 ## Stack
 - Backend: Node.js + Express + Socket.IO + better-sqlite3
@@ -14,13 +14,13 @@ A unified full-stack BTCUSDT tape terminal with live Binance trade flow, trade-d
   - Real-time trade tape (newest at top)
   - Trade-driven tick line chart updated on every trade
   - Last / high / low / move + bid/ask/spread in integrated top bar
-- Replay mode (`/replay`)
-  - Select historical range from stored trades
-  - Replay tick-by-tick with play/pause/reset/speed
-  - Chart and tape update in lockstep
 - Backend persistence
   - Trades: trade ID, symbol, price, quantity, trade time, maker flag, inferred side, ingest timestamp
   - Book ticker snapshots: bid/ask price + qty and timestamp
+- Quant workspace (`/quant`)
+  - Upload and validate strategies
+  - Run historical backtests against stored trades
+  - Review performance metrics and results
 
 ## Local development
 ```bash
@@ -40,8 +40,6 @@ Server uses `PORT` and serves `client/dist` from Express for single-service depl
 
 ## API endpoints
 - `GET /api/health`
-- `GET /api/history/range`
-- `GET /api/history/trades?start=<ms>&end=<ms>&limit=20000`
 
 ## Render deployment
 Use a single Web Service:

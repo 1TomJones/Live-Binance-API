@@ -13,7 +13,6 @@ import {
   getQuantBacktestJobById,
   getQuantResultByJobId,
   getRecentTrades,
-  getTradeRange,
   getTradesByRange,
   listQuantBacktestJobs,
   listQuantJobProgress,
@@ -737,23 +736,6 @@ app.get('/api/session/debug', (_req, res) => {
     vwapHasVariance: snapshot.debug.vwapHasVariance,
     cvdBarsWithTrades: snapshot.debug.cvdBarsWithTrades
   });
-});
-
-app.get('/api/history/range', (_req, res) => {
-  res.json({ symbol: SYMBOL, ...getTradeRange(SYMBOL) });
-});
-
-app.get('/api/history/trades', (req, res) => {
-  const start = Number(req.query.start);
-  const end = Number(req.query.end);
-  const limit = Number(req.query.limit || 20000);
-
-  if (!Number.isFinite(start) || !Number.isFinite(end)) {
-    return res.status(400).json({ error: 'start and end query params are required' });
-  }
-
-  const trades = getTradesByRange(SYMBOL, start, end, limit);
-  return res.json({ symbol: SYMBOL, count: trades.length, trades });
 });
 
 const __filename = fileURLToPath(import.meta.url);
