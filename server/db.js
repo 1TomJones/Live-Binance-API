@@ -154,6 +154,23 @@ const upsertLiveRunStmt = db.prepare(`
     updated_at = excluded.updated_at
 `);
 
+const QUANT_BACKTEST_JOB_UPDATE_DEFAULTS = Object.freeze({
+  status: null,
+  progress_pct: null,
+  processed_items: null,
+  current_marker: null,
+  elapsed_ms: null,
+  result_id: null,
+  error_message: null
+});
+
+function normalizeQuantBacktestJobPatch(patch = {}) {
+  return {
+    ...QUANT_BACKTEST_JOB_UPDATE_DEFAULTS,
+    ...(patch || {})
+  };
+}
+
 export function saveTrade(trade) {
   insertTradeStmt.run(trade);
 }
@@ -257,9 +274,11 @@ export function createQuantBacktestJob(record) {
   return job;
 }
 
-export function updateQuantBacktestJob(id, patch) {
-  updateJobStmt.run({ id, ...patch, updated_at: Date.now() });
+export function updateQuantBacktestJob(id, patch = {}) {
+  const normalizedPatch = normalizeQuantBacktestJobPatch(patch);
+  updateJobStmt.run({ id, ...normalizedPatch, updated_at: Date.now() });
   const job = getQuantBacktestJobById(id);
+  if (!job) return null;
   saveQuantJobProgress({
     job_id: id,
     status: job.status,
@@ -272,11 +291,24 @@ export function updateQuantBacktestJob(id, patch) {
 }
 
 export function completeQuantBacktestJob(id, patch) {
-  return updateQuantBacktestJob(id, { ...patch, status: 'completed' });
+  return updateQuantBacktestJob(id, { ...patch, status: 'completed', error_message: null });
 }
 
-export function failQuantBacktestJob(id, errorMessage) {
-  return updateQuantBacktestJob(id, { status: 'failed', error_message: errorMessage, current_marker: 'Failed' });
+export function failQuantBacktestJob(id, errorOrMessage, patch = {}) {
+  const existingJob = getQuantBacktestJobById(id);
+  const errorMessage = errorOrMessage instanceof Error
+    ? (errorOrMessage.stack || errorOrMessage.message)
+    : String(errorOrMessage || 'Backtest job failed.');
+
+  return updateQuantBacktestJob(id, {
+    progress_pct: existingJob?.progress_pct ?? 0,
+    processed_items: existingJob?.processed_items ?? 0,
+    elapsed_ms: existingJob?.elapsed_ms ?? null,
+    status: 'failed',
+    error_message: errorMessage,
+    current_marker: patch.current_marker || 'Failed',
+    ...patch
+  });
 }
 
 export function getQuantBacktestJobById(id) {

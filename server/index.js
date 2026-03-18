@@ -782,8 +782,16 @@ app.get('/api/quant/runs', (_req, res) => {
 });
 
 app.get('/api/quant/live-metrics', (_req, res) => {
-  const snapshot = liveStrategyRunner.tick() || liveStrategyRunner.getSnapshot();
-  return res.json({ snapshot });
+  try {
+    const snapshot = liveStrategyRunner.tick() || liveStrategyRunner.getSnapshot();
+    return res.json({ snapshot });
+  } catch (error) {
+    console.error('[api] failed to build live metrics snapshot', error);
+    return res.status(500).json({
+      error: error.message || 'Unable to load live metrics.',
+      snapshot: liveStrategyRunner.getSnapshot?.() || null
+    });
+  }
 });
 
 app.get('/api/quant/live/strategies', (_req, res) => {
@@ -870,11 +878,25 @@ app.get('/api/session/debug', (_req, res) => {
   });
 });
 
+app.use('/api', (_req, res) => {
+  return res.status(404).json({ error: 'API route not found.' });
+});
+
+app.use((error, req, res, next) => {
+  if (!req.path.startsWith('/api')) return next(error);
+  console.error('[api] unhandled error', error);
+  if (res.headersSent) return next(error);
+  return res.status(error.status || 500).json({
+    error: error.message || 'Internal server error.'
+  });
+});
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const clientDist = path.resolve(__dirname, '../client/dist');
 
 app.use(express.static(clientDist));
-app.get('*', (_req, res) => {
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api')) return next();
   res.sendFile(path.join(clientDist, 'index.html'));
 });
