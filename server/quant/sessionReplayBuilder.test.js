@@ -5,20 +5,23 @@ import { buildCanonicalMinuteCandles } from '../sessionAnalytics.js';
 import {
   buildCvdMinuteCandlesFromTrades,
   buildSessionReplay,
-  buildTradeBucketMap
+  buildTradeBucketMap,
+  REPLAY_EXECUTION_MODES
 } from './sessionReplayBuilder.js';
 
-test('shared session replay builder keeps live-style and backtest replay indicators in parity', () => {
+test('strict live parity mode keeps live and backtest execution feeds identical', () => {
   const { trades, timeframe, sessionStartMs, nowMs } = fixture;
 
   const liveStyleReplay = buildSessionReplay({
     timeframe,
+    replayMode: 'live',
+    executionMode: REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY,
     sessionStartMs,
     nowMs,
     minuteCandles: buildCanonicalMinuteCandles(trades, {
       sessionStartMs,
       nowMs,
-      includeEmptyMinutes: false
+      includeEmptyMinutes: true
     }),
     cvdMinuteCandles: buildCvdMinuteCandlesFromTrades(trades, { sessionStartMs, nowMs }),
     byBucket: buildTradeBucketMap(trades, timeframe, { sessionStartMs, nowMs })
@@ -26,18 +29,21 @@ test('shared session replay builder keeps live-style and backtest replay indicat
 
   const backtestReplay = buildSessionReplay({
     timeframe,
+    replayMode: 'backtest',
+    executionMode: REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY,
     sessionStartMs,
     nowMs,
     trades
   });
 
+  assert.equal(backtestReplay.executionMode, REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY);
   assert.deepStrictEqual(normalizeReplay(liveStyleReplay.engineCandles), normalizeReplay(backtestReplay.engineCandles));
   assert.deepStrictEqual(normalizeReplay(backtestReplay.closedEngineCandles), normalizeReplay(backtestReplay.engineCandles));
   assert.deepStrictEqual(normalizeSeries(liveStyleReplay.vwap), normalizeSeries(backtestReplay.vwap));
   assert.deepStrictEqual(normalizeReplay(liveStyleReplay.cvd), normalizeReplay(backtestReplay.cvd));
 });
 
-test('backtest replay excludes synthetic scaffold candles from the execution feed', () => {
+test('trade-only mode remains available as the explicit legacy backtest feed', () => {
   const sessionStartMs = Date.UTC(2025, 0, 1, 0, 0, 0, 0);
   const nowMs = sessionStartMs + (4 * 60 * 1000);
   const minuteCandles = [
@@ -49,14 +55,25 @@ test('backtest replay excludes synthetic scaffold candles from the execution fee
   const liveReplay = buildSessionReplay({
     timeframe: '1m',
     replayMode: 'live',
+    executionMode: REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY,
     sessionStartMs,
     nowMs,
     minuteCandles
   });
 
-  const backtestReplay = buildSessionReplay({
+  const parityBacktestReplay = buildSessionReplay({
     timeframe: '1m',
     replayMode: 'backtest',
+    executionMode: REPLAY_EXECUTION_MODES.STRICT_LIVE_PARITY,
+    sessionStartMs,
+    nowMs,
+    minuteCandles
+  });
+
+  const tradeOnlyBacktestReplay = buildSessionReplay({
+    timeframe: '1m',
+    replayMode: 'backtest',
+    executionMode: REPLAY_EXECUTION_MODES.TRADE_ONLY,
     sessionStartMs,
     nowMs,
     minuteCandles
@@ -72,15 +89,21 @@ test('backtest replay excludes synthetic scaffold candles from the execution fee
   );
 
   assert.deepStrictEqual(
-    backtestReplay.closedEngineCandles.map((candle) => ({ time: candle.time, hasTrades: candle.hasTrades })),
+    parityBacktestReplay.closedEngineCandles.map((candle) => ({ time: candle.time, hasTrades: candle.hasTrades })),
+    liveReplay.engineCandles.map((candle) => ({ time: candle.time, hasTrades: candle.hasTrades }))
+  );
+
+  assert.deepStrictEqual(
+    tradeOnlyBacktestReplay.closedEngineCandles.map((candle) => ({ time: candle.time, hasTrades: candle.hasTrades })),
     [
       { time: sessionStartMs / 1000, hasTrades: true },
       { time: sessionStartMs / 1000 + 120, hasTrades: true }
     ]
   );
 
-  assert.equal(backtestReplay.candles.filter((candle) => candle.state === 'placeholder').length, 2);
-  assert.equal(backtestReplay.candles.filter((candle) => candle.state === 'synthetic').length, 1);
+  assert.equal(tradeOnlyBacktestReplay.executionMode, REPLAY_EXECUTION_MODES.TRADE_ONLY);
+  assert.equal(parityBacktestReplay.candles.filter((candle) => candle.state === 'placeholder').length, 2);
+  assert.equal(parityBacktestReplay.candles.filter((candle) => candle.state === 'synthetic').length, 1);
 });
 
 function normalizeReplay(series = []) {

@@ -17,11 +17,17 @@ const DEFAULT_SETTINGS = {
   enableShort: true
 };
 
+const BACKTEST_EXECUTION_MODE_OPTIONS = [
+  { value: 'strict_live_parity', label: 'Live-parity simulation', help: 'Replays the same closed-candle stream as live, including synthetic no-trade candles.' },
+  { value: 'trade_only', label: 'Trade-only replay', help: 'Skips no-trade candles for faster historical analysis when exact live parity is not required.' }
+];
+
 const DEFAULT_BACKTEST_CONFIG = {
   startDate: '',
   endDate: '',
   replaySpeed: 60,
   initialBalance: 10000,
+  executionMode: 'strict_live_parity',
   ...DEFAULT_SETTINGS
 };
 
@@ -123,6 +129,10 @@ export function QuantWorkspacePage() {
   };
 
   const handleBacktestDateChange = (field) => (event) => {
+    setBacktestConfig((prev) => ({ ...prev, [field]: event.target.value }));
+  };
+
+  const handleBacktestSelectChange = (field) => (event) => {
     setBacktestConfig((prev) => ({ ...prev, [field]: event.target.value }));
   };
 
@@ -443,6 +453,12 @@ export function QuantWorkspacePage() {
                 <Field label="Replay speed target">
                   <input type="range" min="1" max={limits.maxReplaySpeed || 60} step="1" value={backtestConfig.replaySpeed} onChange={handleBacktestNumberChange('replaySpeed')} />
                   <small>{backtestConfig.replaySpeed}x target · backend runs as fast as practical.</small>
+                </Field>
+                <Field label="Replay execution mode">
+                  <select value={backtestConfig.executionMode} onChange={handleBacktestSelectChange('executionMode')}>
+                    {BACKTEST_EXECUTION_MODE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  </select>
+                  <small>{BACKTEST_EXECUTION_MODE_OPTIONS.find((option) => option.value === backtestConfig.executionMode)?.help}</small>
                 </Field>
                 <Field label="Stop loss %">
                   <input type="number" min="0.01" max="25" step="0.01" value={backtestConfig.stopLossPct} onChange={handleBacktestNumberChange('stopLossPct')} />

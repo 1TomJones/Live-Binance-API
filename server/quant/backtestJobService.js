@@ -70,6 +70,7 @@ export class BacktestJobService {
           analyses: resultPayload.analyses,
           dayResults: resultPayload.dayResults,
           replaySpeed: resultPayload.replaySpeed,
+          executionMode: resultPayload.executionMode,
           strategy: resolved.summary
         }),
         equity_series_json: JSON.stringify({
