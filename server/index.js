@@ -22,14 +22,15 @@ import {
   saveQuantStrategy,
   saveTrade,
   updateQuantBacktestJob,
-  getQuantStrategyById
+  getQuantStrategyById,
+  listQuantStrategies
 } from './db.js';
 import { BacktestJobService } from './quant/backtestJobService.js';
 import { StrategyParser } from './quant/strategyParser.js';
-import { StrategyExecutionEngine } from './quant/strategyExecutionEngine.js';
+import { PAPER_EXECUTION_LIMITS, StrategyExecutionEngine } from './quant/strategyExecutionEngine.js';
 import { BacktestRunner } from './quant/backtestRunner.js';
 import { LivePaperRunner, LIVE_PAPER_LIMITS } from './quant/livePaperRunner.js';
-import { listBuiltInLiveStrategies } from './quant/builtinStrategies.js';
+import { getBuiltInStrategyDefinition, listBuiltInStrategyCatalog } from './quant/builtinStrategies.js';
 import { StrategyUploadService, StrategyValidationService } from './quant/strategyServices.js';
 import {
   buildVolumeProfileFromCandles,
@@ -535,6 +536,73 @@ const strategyUploadService = new StrategyUploadService({
 
 const strategyParser = new StrategyParser();
 const executionEngine = new StrategyExecutionEngine();
+
+function resolveStrategy(strategyRef = {}) {
+  if (!strategyRef || typeof strategyRef !== 'object') return null;
+
+  if (strategyRef.kind === 'built_in') {
+    const definition = getBuiltInStrategyDefinition(strategyRef.key);
+    if (!definition) return null;
+    return {
+      strategy: definition.strategy,
+      summary: {
+        id: definition.key,
+        name: definition.strategy.metadata.name,
+        description: definition.description,
+        timeframe: definition.strategy.market.timeframe,
+        symbol: definition.strategy.market.symbol,
+        entryRules: definition.entryRules,
+        exitRules: definition.exitRules,
+        source: 'built_in'
+      }
+    };
+  }
+
+  if (strategyRef.kind === 'uploaded') {
+    const record = getQuantStrategyById(Number(strategyRef.id));
+    if (!record) return null;
+    const parsed = strategyParser.parse(record.raw_content);
+    if (!parsed.valid) throw new Error(`Strategy invalid: ${parsed.errors.join('; ')}`);
+    return {
+      strategy: parsed.strategy,
+      summary: {
+        id: record.id,
+        name: parsed.summary.name,
+        description: record.parse_message || 'Uploaded JSON strategy.',
+        timeframe: parsed.summary.timeframe,
+        symbol: parsed.summary.symbol,
+        entryRules: { long: 'Uploaded strategy long rule set', short: 'Uploaded strategy short rule set' },
+        exitRules: { long: 'Uploaded strategy long exit rules', short: 'Uploaded strategy short exit rules' },
+        source: 'uploaded',
+        fileName: record.file_name
+      }
+    };
+  }
+
+  return null;
+}
+
+function buildStrategyCatalog() {
+  const builtIn = listBuiltInStrategyCatalog();
+  const uploaded = listQuantStrategies(50).map((record) => {
+    const metadata = record.metadata_json ? JSON.parse(record.metadata_json) : {};
+    return {
+      id: record.id,
+      key: `uploaded-${record.id}`,
+      name: metadata.name || record.file_name,
+      label: metadata.name || record.file_name,
+      description: record.parse_message || 'Uploaded JSON strategy.',
+      symbol: metadata.symbol || SYMBOL,
+      timeframe: metadata.timeframe || '1m',
+      source: 'uploaded',
+      fileName: record.file_name,
+      summary: metadata
+    };
+  });
+
+  return { builtIn, uploaded };
+}
+
 const backtestRunner = new BacktestRunner({
   executionEngine,
   loadTrades: ({ symbol, startMs, endMs, limit }) => getTradesByRange(symbol, startMs, endMs, limit)
@@ -542,8 +610,7 @@ const backtestRunner = new BacktestRunner({
 
 const backtestJobService = new BacktestJobService({
   backtestRunner,
-  strategyParser,
-  getStrategyById: getQuantStrategyById,
+  resolveStrategy,
   createJob: createQuantBacktestJob,
   updateJob: updateQuantBacktestJob,
   completeJob: completeQuantBacktestJob,
@@ -591,7 +658,9 @@ function buildLiveMarketSnapshot() {
 const liveStrategyRunner = new LivePaperRunner({
   getMarketSnapshot: buildLiveMarketSnapshot,
   saveLiveState: ({ strategyId, status, stateJson }) => saveQuantLiveRun({ strategyId, status, stateJson }),
-  getLiveState: () => null
+  getLiveState: () => null,
+  strategyResolver: resolveStrategy,
+  executionEngine
 });
 
 const stream = new BinanceStreamService({
@@ -658,13 +727,20 @@ app.post('/api/quant/strategy/upload', (req, res) => {
   return res.json(result);
 });
 
+app.get('/api/quant/strategies/catalog', (_req, res) => {
+  return res.json({
+    strategies: buildStrategyCatalog(),
+    limits: PAPER_EXECUTION_LIMITS
+  });
+});
+
 app.post('/api/quant/backtests', (req, res) => {
-  const { strategyId, runConfig } = req.body || {};
-  if (!strategyId || !runConfig) {
-    return res.status(400).json({ error: 'strategyId and runConfig are required.' });
+  const { strategyRef, runConfig } = req.body || {};
+  if (!strategyRef || !runConfig) {
+    return res.status(400).json({ error: 'strategyRef and runConfig are required.' });
   }
 
-  const job = backtestJobService.start({ strategyId, runConfig });
+  const job = backtestJobService.start({ strategyRef, runConfig });
   return res.status(202).json({ jobId: job.id, job });
 });
 
@@ -680,7 +756,16 @@ app.get('/api/quant/backtests/:jobId', (req, res) => {
 
   const progress = backtestJobService.getProgress(jobId);
   const result = getQuantResultByJobId(jobId);
-  return res.json({ job, progress, result });
+  return res.json({
+    job,
+    progress,
+    result: result ? {
+      ...result,
+      summary: JSON.parse(result.summary_json || '{}'),
+      series: JSON.parse(result.equity_series_json || '{}'),
+      tradeLog: JSON.parse(result.trade_log_json || '[]')
+    } : null
+  });
 });
 
 app.get('/api/quant/runs', (_req, res) => {
@@ -699,16 +784,16 @@ app.get('/api/quant/live-metrics', (_req, res) => {
 
 app.get('/api/quant/live/strategies', (_req, res) => {
   return res.json({
-    strategies: listBuiltInLiveStrategies(),
+    strategies: buildStrategyCatalog(),
     limits: LIVE_PAPER_LIMITS
   });
 });
 
 app.post('/api/quant/live/start', (req, res) => {
   try {
-    const { strategyKey, runConfig } = req.body || {};
-    if (!strategyKey) return res.status(400).json({ error: 'strategyKey is required.' });
-    const run = liveStrategyRunner.start({ strategyKey, runConfig: runConfig || {} });
+    const { strategyRef, runConfig } = req.body || {};
+    if (!strategyRef) return res.status(400).json({ error: 'strategyRef is required.' });
+    const run = liveStrategyRunner.start({ strategyRef, runConfig: runConfig || {} });
     return res.json({ run });
   } catch (error) {
     return res.status(400).json({ error: error.message || 'Unable to start live paper strategy.' });
