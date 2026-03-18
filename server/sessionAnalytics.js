@@ -291,17 +291,15 @@ export function computeSessionCvdFromMinuteCandles(minuteCandles = [], timeframe
   return result;
 }
 
-export function buildVolumeProfileByDollar(trades) {
-  if (!trades.length) return [];
+function normalizeVolumeProfile(volumeMap = new Map()) {
+  if (!volumeMap.size) return [];
 
-  const buckets = new Map();
-  trades.forEach((trade) => {
-    const bucket = Math.round(Number(trade.price));
-    const volume = Number(trade.quantity || 0);
-    buckets.set(bucket, (buckets.get(bucket) || 0) + volume);
-  });
+  const sorted = [...volumeMap.entries()]
+    .filter(([price, volume]) => Number.isFinite(price) && Number.isFinite(volume) && volume > 0)
+    .sort((a, b) => a[0] - b[0]);
 
-  const sorted = [...buckets.entries()].sort((a, b) => a[0] - b[0]);
+  if (!sorted.length) return [];
+
   const maxVolume = Math.max(...sorted.map(([, volume]) => volume), 1);
 
   return sorted.map(([price, volume]) => ({
@@ -311,15 +309,42 @@ export function buildVolumeProfileByDollar(trades) {
   }));
 }
 
+export function buildVolumeProfileByDollar(trades = []) {
+  const buckets = new Map();
+
+  trades.forEach((trade) => {
+    const price = Math.floor(Number(trade.price));
+    const volume = Number(trade.quantity || 0);
+    if (!Number.isFinite(price) || !Number.isFinite(volume) || volume <= 0) return;
+
+    buckets.set(price, (buckets.get(price) || 0) + volume);
+  });
+
+  return normalizeVolumeProfile(buckets);
+}
+
+export function buildVolumeProfileFromCandles(candles = []) {
+  const buckets = new Map();
+
+  candles.forEach((candle) => {
+    const low = Math.floor(Number(candle.low));
+    const high = Math.floor(Number(candle.high));
+    const volume = Number(candle.volume || 0);
+    if (!Number.isFinite(low) || !Number.isFinite(high) || !Number.isFinite(volume) || volume <= 0) return;
+
+    const start = Math.min(low, high);
+    const end = Math.max(low, high);
+    const bucketCount = Math.max(end - start + 1, 1);
+    const volumePerBucket = volume / bucketCount;
+
+    for (let price = start; price <= end; price += 1) {
+      buckets.set(price, (buckets.get(price) || 0) + volumePerBucket);
+    }
+  });
+
+  return normalizeVolumeProfile(buckets);
+}
+
 export function buildVolumeProfileFromMap(volumeMap = new Map()) {
-  if (!volumeMap.size) return [];
-
-  const sorted = [...volumeMap.entries()].sort((a, b) => a[0] - b[0]);
-  const maxVolume = Math.max(...sorted.map(([, volume]) => volume), 1);
-
-  return sorted.map(([price, volume]) => ({
-    price,
-    volume,
-    ratio: volume / maxVolume
-  }));
+  return normalizeVolumeProfile(volumeMap);
 }

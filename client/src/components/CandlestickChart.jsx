@@ -1,4 +1,4 @@
-import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 
 let lightweightChartsLoader = null;
@@ -36,9 +36,11 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
   const vwapSeriesRef = useRef(null);
   const lowerChartRef = useRef(null);
   const cvdSeriesRef = useRef(null);
+  const profileRef = useRef([]);
+  const indicatorsRef = useRef(defaultIndicators);
 
-  const visibleRangeTimerRef = useRef(null);
   const snapshotRefreshTimerRef = useRef(null);
+  const profileRefreshTimerRef = useRef(null);
 
   const [timeframe, setTimeframe] = useState('1m');
   const [menuOpen, setMenuOpen] = useState(false);
@@ -47,41 +49,42 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
 
   const showLowerPanel = indicators.cvd;
 
-  const refreshVolumeProfileForVisibleRange = async () => {
-    const chart = chartRef.current;
-    if (!chart || !indicators.volumeProfile) return;
+  useEffect(() => {
+    profileRef.current = profile;
+  }, [profile]);
 
-    const range = chart.timeScale().getVisibleRange();
-    if (!range?.from || !range?.to) return;
-
-    const response = await fetch(`/api/indicators/volume-profile?timeframe=${timeframe}&from=${Math.floor(range.from)}&to=${Math.ceil(range.to)}`);
-    const payload = await response.json();
-
-    if (import.meta.env.DEV) {
-      console.debug('[volume-profile]', {
-        timeframe,
-        from: Math.floor(range.from),
-        to: Math.ceil(range.to),
-        buckets: (payload.profile || []).length
-      });
-    }
-
-    setProfile(payload.profile || []);
-  };
+  useEffect(() => {
+    indicatorsRef.current = indicators;
+  }, [indicators]);
 
   const compactLabel = useMemo(() => {
     const enabled = Object.entries(indicators).filter(([, value]) => value).map(([key]) => key);
     return enabled.length ? `Indicators (${enabled.length})` : 'Indicators';
   }, [indicators]);
 
-  const drawVolumeProfile = () => {
-    const chart = chartRef.current;
-    const series = candleSeriesRef.current;
+  const clearVolumeProfile = useCallback(() => {
     const canvas = overlayCanvasRef.current;
-    if (!chart || !series || !canvas || !indicators.volumeProfile) return;
-
     const width = containerRef.current?.clientWidth || 0;
     const height = containerRef.current?.clientHeight || 0;
+    if (!canvas) return;
+
+    canvas.width = width;
+    canvas.height = height;
+
+    const ctx = canvas.getContext('2d');
+    ctx?.clearRect(0, 0, width, height);
+  }, []);
+
+  const drawVolumeProfile = useCallback(() => {
+    const series = candleSeriesRef.current;
+    const canvas = overlayCanvasRef.current;
+    const width = containerRef.current?.clientWidth || 0;
+    const height = containerRef.current?.clientHeight || 0;
+    const activeIndicators = indicatorsRef.current;
+    const activeProfile = profileRef.current;
+
+    if (!canvas || !width || !height) return;
+
     canvas.width = width;
     canvas.height = height;
 
@@ -89,20 +92,41 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
     if (!ctx) return;
     ctx.clearRect(0, 0, width, height);
 
-    const maxWidth = width * 0.17;
-    profile.forEach((bucket) => {
-      const y1 = series.priceToCoordinate(bucket.price);
-      const y2 = series.priceToCoordinate(bucket.price + 1);
-      if (!Number.isFinite(y1) || !Number.isFinite(y2)) return;
-      const top = Math.min(y1, y2);
-      const barHeight = Math.max(Math.abs(y1 - y2), 1);
-      const barWidth = maxWidth * bucket.ratio;
-      ctx.fillStyle = 'rgba(125, 145, 182, 0.34)';
-      ctx.fillRect(width - barWidth - 3, top, barWidth, barHeight);
-    });
-  };
+    if (!activeIndicators.volumeProfile || !series || !activeProfile.length) return;
 
-  const refreshSessionSnapshot = async ({ fit = false } = {}) => {
+    const maxBarWidth = Math.max(width * 0.18, 60);
+    const rightPadding = 10;
+
+    activeProfile.forEach((bucket) => {
+      const topCoord = series.priceToCoordinate(bucket.price + 1);
+      const bottomCoord = series.priceToCoordinate(bucket.price);
+      if (!Number.isFinite(topCoord) || !Number.isFinite(bottomCoord)) return;
+
+      const top = Math.min(topCoord, bottomCoord);
+      const barHeight = Math.max(Math.abs(bottomCoord - topCoord), 1);
+      const barWidth = Math.max(bucket.ratio * maxBarWidth, 1);
+
+      ctx.fillStyle = 'rgba(95, 128, 184, 0.18)';
+      ctx.fillRect(width - maxBarWidth - rightPadding, top, maxBarWidth, barHeight);
+
+      ctx.fillStyle = 'rgba(125, 173, 255, 0.52)';
+      ctx.fillRect(width - barWidth - rightPadding, top, barWidth, barHeight);
+    });
+  }, []);
+
+  const refreshVolumeProfile = useCallback(async () => {
+    if (!indicators.volumeProfile) {
+      setProfile([]);
+      clearVolumeProfile();
+      return;
+    }
+
+    const response = await fetch(`/api/indicators/volume-profile?timeframe=${timeframe}`);
+    const payload = await response.json();
+    setProfile(payload.profile || []);
+  }, [clearVolumeProfile, indicators.volumeProfile, timeframe]);
+
+  const refreshSessionSnapshot = useCallback(async ({ fit = false } = {}) => {
     const response = await fetch(`/api/session/snapshot?timeframe=${timeframe}`);
     const payload = await response.json();
 
@@ -139,7 +163,7 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
 
     if (fit) chartRef.current?.timeScale().fitContent();
     drawVolumeProfile();
-  };
+  }, [drawVolumeProfile, indicators.cvd, indicators.vwap, timeframe]);
 
   useEffect(() => {
     let mounted = true;
@@ -215,61 +239,54 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
 
   useEffect(() => {
     refreshSessionSnapshot({ fit: true });
-  }, [timeframe]);
+  }, [refreshSessionSnapshot, timeframe]);
 
   useEffect(() => {
     if (!vwapSeriesRef.current) return;
     vwapSeriesRef.current.applyOptions({ visible: indicators.vwap });
     if (!indicators.vwap) vwapSeriesRef.current.setData([]);
     refreshSessionSnapshot();
-  }, [indicators.vwap]);
+  }, [indicators.vwap, refreshSessionSnapshot]);
 
   useEffect(() => {
     if (!cvdSeriesRef.current) return;
     cvdSeriesRef.current.applyOptions({ visible: indicators.cvd });
     if (!indicators.cvd) cvdSeriesRef.current.setData([]);
     refreshSessionSnapshot();
-  }, [indicators.cvd]);
+  }, [indicators.cvd, refreshSessionSnapshot]);
+
+  useEffect(() => {
+    refreshVolumeProfile();
+  }, [refreshVolumeProfile]);
+
+  useEffect(() => {
+    drawVolumeProfile();
+  }, [drawVolumeProfile, indicators.volumeProfile, profile]);
 
   useEffect(() => {
     const onTrade = () => {
-      if (snapshotRefreshTimerRef.current) return;
-      snapshotRefreshTimerRef.current = window.setTimeout(() => {
-        snapshotRefreshTimerRef.current = null;
-        refreshSessionSnapshot();
-        refreshVolumeProfileForVisibleRange();
-      }, 250);
+      if (!snapshotRefreshTimerRef.current) {
+        snapshotRefreshTimerRef.current = window.setTimeout(() => {
+          snapshotRefreshTimerRef.current = null;
+          refreshSessionSnapshot();
+        }, 250);
+      }
+
+      if (indicators.volumeProfile && !profileRefreshTimerRef.current) {
+        profileRefreshTimerRef.current = window.setTimeout(() => {
+          profileRefreshTimerRef.current = null;
+          refreshVolumeProfile();
+        }, 250);
+      }
     };
 
     chartSocket.on('trade', onTrade);
     return () => {
       chartSocket.off('trade', onTrade);
       if (snapshotRefreshTimerRef.current) window.clearTimeout(snapshotRefreshTimerRef.current);
+      if (profileRefreshTimerRef.current) window.clearTimeout(profileRefreshTimerRef.current);
     };
-  }, [timeframe, indicators.vwap, indicators.cvd, indicators.volumeProfile]);
-
-  useEffect(() => {
-    drawVolumeProfile();
-  }, [profile, indicators.volumeProfile]);
-
-  useEffect(() => {
-    const chart = chartRef.current;
-    if (!chart || !indicators.volumeProfile) return;
-
-    const onRangeChange = () => {
-      if (visibleRangeTimerRef.current) window.clearTimeout(visibleRangeTimerRef.current);
-      visibleRangeTimerRef.current = window.setTimeout(() => {
-        refreshVolumeProfileForVisibleRange();
-      }, 250);
-    };
-
-    onRangeChange();
-    chart.timeScale().subscribeVisibleTimeRangeChange(onRangeChange);
-    return () => {
-      chart.timeScale().unsubscribeVisibleTimeRangeChange(onRangeChange);
-      if (visibleRangeTimerRef.current) window.clearTimeout(visibleRangeTimerRef.current);
-    };
-  }, [timeframe, indicators.volumeProfile]);
+  }, [indicators.volumeProfile, refreshSessionSnapshot, refreshVolumeProfile]);
 
   return (
     <div className="chart-wrap">

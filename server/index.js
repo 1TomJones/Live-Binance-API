@@ -32,6 +32,7 @@ import { BacktestRunner } from './quant/backtestRunner.js';
 import { createDefaultLivePaperRunner } from './quant/livePaperRunner.js';
 import { StrategyUploadService, StrategyValidationService } from './quant/strategyServices.js';
 import {
+  buildVolumeProfileFromCandles,
   buildVolumeProfileFromMap,
   computeSessionCvdFromMinuteCandles,
   computeSessionVwapFromCandles,
@@ -217,7 +218,7 @@ function applyTradeToDerivedState(trade) {
   cvdCandle.close = sessionState.cvdRunning;
   cvdCandle.hasTrades = true;
 
-  const profileBucket = Math.round(Number(trade.price));
+  const profileBucket = Math.floor(Number(trade.price));
   sessionState.volumeProfile.set(profileBucket, (sessionState.volumeProfile.get(profileBucket) || 0) + quantity);
 
   sessionState.lastProcessedTradeId = trade.trade_id;
@@ -424,6 +425,9 @@ async function initializeCurrentSession() {
   const backfilledCandles = await backfillCurrentSessionCandlesFromBinance(dayStartMs, nowMs);
   const mergedCandleCount = mergeMinuteCandlesIntoSession(backfilledCandles);
   const mergedCvdCount = mergeCvdMinuteCandlesIntoSession(buildCvdMinuteCandlesFromKlines(backfilledCandles));
+  sessionState.volumeProfile = new Map(
+    buildVolumeProfileFromCandles(backfilledCandles).map(({ price, volume }) => [price, volume])
+  );
 
   sessionState.hydration = {
     ...sessionState.hydration,
@@ -699,16 +703,17 @@ app.get('/api/indicators/cvd', (req, res) => {
 
 app.get('/api/indicators/volume-profile', (req, res) => {
   const timeframe = req.query.timeframe || '1m';
-  const from = Number(req.query.from);
-  const to = Number(req.query.to);
-
-  if (!Number.isFinite(from) || !Number.isFinite(to)) {
-    return res.status(400).json({ error: 'from and to are required unix seconds' });
-  }
 
   ensureCurrentSession();
   const profile = buildVolumeProfileFromMap(sessionState.volumeProfile);
-  return res.json({ symbol: SYMBOL, timeframe, from, to, profile });
+  return res.json({
+    symbol: SYMBOL,
+    timeframe,
+    sessionStartMs: sessionState.dayStartMs,
+    sessionStartIso: new Date(sessionState.dayStartMs).toISOString(),
+    profile,
+    poc: profile.reduce((best, bucket) => (bucket.volume > (best?.volume || 0) ? bucket : best), null)
+  });
 });
 
 app.get('/api/session/debug', (_req, res) => {
