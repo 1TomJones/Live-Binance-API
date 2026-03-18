@@ -735,13 +735,17 @@ app.get('/api/quant/strategies/catalog', (_req, res) => {
 });
 
 app.post('/api/quant/backtests', (req, res) => {
-  const { strategyRef, runConfig } = req.body || {};
-  if (!strategyRef || !runConfig) {
-    return res.status(400).json({ error: 'strategyRef and runConfig are required.' });
-  }
+  try {
+    const { strategyRef, runConfig } = req.body || {};
+    if (!strategyRef || !runConfig) {
+      return res.status(400).json({ error: 'strategyRef and runConfig are required.' });
+    }
 
-  const job = backtestJobService.start({ strategyRef, runConfig });
-  return res.status(202).json({ jobId: job.id, job });
+    const job = backtestJobService.start({ strategyRef, runConfig });
+    return res.status(202).json({ jobId: job.id, job });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || 'Unable to start backtest.' });
+  }
 });
 
 app.post('/api/quant/backtests/:jobId/cancel', (req, res) => {
