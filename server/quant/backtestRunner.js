@@ -1,9 +1,4 @@
-import {
-  buildCandlesFromTrades,
-  computeSessionCvdFromTrades,
-  computeSessionVwapFromTrades,
-  timeframeToSeconds
-} from '../sessionAnalytics.js';
+import { enrichCandlesFromTrades } from './candleEnrichment.js';
 
 export class BacktestRunner {
   constructor({ executionEngine, loadTrades }) {
@@ -27,7 +22,10 @@ export class BacktestRunner {
         endMs: dayEndMs,
         limit: null
       });
-      const candles = enrichCandles(dayTrades, strategy.market.timeframe, runState.settings);
+      const candles = enrichCandlesFromTrades(dayTrades, strategy.market.timeframe, runState.settings, {
+        sessionStartMs: dayStartMs,
+        nowMs: dayEndMs
+      });
 
       const fillModel = this.executionEngine.createFillModel({
         syntheticSpreadBps: runState.settings.syntheticSpreadBps
@@ -81,42 +79,6 @@ export class BacktestRunner {
       dayResults
     };
   }
-}
-
-function enrichCandles(trades, timeframe, settings) {
-  const candles = buildCandlesFromTrades(trades, timeframe);
-  const vwap = new Map(computeSessionVwapFromTrades(trades, timeframe).map((x) => [x.time, x.value]));
-  const cvd = new Map(computeSessionCvdFromTrades(trades, timeframe).map((x) => [x.time, x]));
-  const byBucket = new Map();
-
-  const tfSec = timeframeToSeconds(timeframe);
-  for (const trade of trades) {
-    const time = Math.floor((trade.trade_time / 1000) / tfSec) * tfSec;
-    const bucket = byBucket.get(time) || { buy: 0, sell: 0 };
-    if (trade.side === 'buy') bucket.buy += Number(trade.quantity || 0);
-    else bucket.sell += Number(trade.quantity || 0);
-    byBucket.set(time, bucket);
-  }
-
-  return candles.map((candle, idx, arr) => {
-    const bucket = byBucket.get(candle.time) || { buy: 0, sell: 0 };
-    const recent = arr.slice(Math.max(0, idx - 19), idx + 1);
-    const avgVolume20 = recent.reduce((acc, x) => acc + x.volume, 0) / Math.max(recent.length, 1);
-    const cvdCandle = cvd.get(candle.time) || { open: 0, high: 0, low: 0, close: 0 };
-    return {
-      ...candle,
-      vwap_session: vwap.get(candle.time) ?? candle.close,
-      cvd_open: cvdCandle.open,
-      cvd_high: cvdCandle.high,
-      cvd_low: cvdCandle.low,
-      cvd_close: cvdCandle.close,
-      dom_visible_buy_limits: bucket.buy,
-      dom_visible_sell_limits: bucket.sell,
-      avg_volume_20: avgVolume20,
-      stopLossPct: settings.stopLossPct,
-      takeProfitPct: settings.takeProfitPct
-    };
-  });
 }
 
 function normalizeDay(value) {

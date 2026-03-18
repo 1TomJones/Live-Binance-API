@@ -29,6 +29,7 @@ import { BacktestJobService } from './quant/backtestJobService.js';
 import { StrategyParser } from './quant/strategyParser.js';
 import { PAPER_EXECUTION_LIMITS, StrategyExecutionEngine } from './quant/strategyExecutionEngine.js';
 import { BacktestRunner } from './quant/backtestRunner.js';
+import { enrichMarketCandles } from './quant/candleEnrichment.js';
 import { LivePaperRunner, LIVE_PAPER_LIMITS } from './quant/livePaperRunner.js';
 import { getBuiltInStrategyDefinition, listBuiltInStrategyCatalog } from './quant/builtinStrategies.js';
 import { StrategyUploadService, StrategyValidationService } from './quant/strategyServices.js';
@@ -624,19 +625,9 @@ function buildLiveMarketSnapshot() {
   const session = buildSessionPayload('1m');
   const vwapByTime = new Map((session.vwap || []).map((point) => [point.time, point.value]));
   const cvdByTime = new Map((session.cvd || []).map((point) => [point.time, point]));
-  const candles = (session.candles || [])
-    .filter((candle) => !candle.isPlaceholder && Number.isFinite(candle.open) && Number.isFinite(candle.close))
-    .map((candle, index, arr) => {
-      const cvdCandle = cvdByTime.get(candle.time) || {};
-      const previous = arr[index - 1] || candle;
-      const previousCvd = cvdByTime.get(previous.time) || cvdCandle;
-      return {
-        ...candle,
-        vwap: vwapByTime.get(candle.time) ?? candle.close,
-        cvd_close: cvdCandle.close ?? 0,
-        prev_cvd_close: previousCvd.close ?? cvdCandle.close ?? 0
-      };
-    });
+  const rawCandles = (session.candles || [])
+    .filter((candle) => !candle.isPlaceholder && Number.isFinite(candle.open) && Number.isFinite(candle.close));
+  const candles = enrichMarketCandles(rawCandles, { vwapByTime, cvdByTime });
 
   const nowMinuteSec = Math.floor(Date.now() / 60000) * 60;
   const closedCandles = candles.filter((candle) => candle.time < nowMinuteSec);
