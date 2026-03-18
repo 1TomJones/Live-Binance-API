@@ -86,8 +86,20 @@ export class BacktestJobService {
         elapsed_ms: Date.now() - startedAt
       });
     } catch (error) {
-      if (String(error.message).includes('cancelled')) return;
-      this.failJob(jobId, error.message || 'Backtest job failed.');
+      if (String(error?.message).includes('cancelled')) return;
+
+      try {
+        this.failJob(jobId, error, {
+          elapsed_ms: Date.now() - startedAt,
+          current_marker: 'Failed'
+        });
+      } catch (failError) {
+        console.error('[backtest] unable to persist failed job state', {
+          jobId,
+          error: failError?.message || failError,
+          cause: error?.message || error
+        });
+      }
     }
   }
 
