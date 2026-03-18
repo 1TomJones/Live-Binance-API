@@ -1,38 +1,89 @@
-import { buildCandlesFromTrades, computeSessionCvdFromTrades, computeSessionVwapFromTrades, timeframeToSeconds } from '../sessionAnalytics.js';
-import { StrategyExecutionEngine } from './strategyExecutionEngine.js';
+import {
+  buildCandlesFromTrades,
+  computeSessionCvdFromTrades,
+  computeSessionVwapFromTrades,
+  timeframeToSeconds
+} from '../sessionAnalytics.js';
 
 export class BacktestRunner {
-  constructor({ executionEngine = new StrategyExecutionEngine(), loadTrades }) {
+  constructor({ executionEngine, loadTrades }) {
     this.executionEngine = executionEngine;
     this.loadTrades = loadTrades;
   }
 
-  run({ strategy, runConfig, progressCallback }) {
-    const startMs = runConfig.startDate ? Date.parse(runConfig.startDate) : 0;
-    const endMs = runConfig.endDate ? Date.parse(runConfig.endDate) + 86400000 - 1 : Date.now();
-    const trades = this.loadTrades({
-      symbol: strategy.market.symbol,
-      startMs,
-      endMs,
-      limit: 400000
+  run({ strategy, runConfig, progressCallback, shouldStop }) {
+    const startDate = normalizeDay(runConfig.startDate);
+    const endDate = normalizeDay(runConfig.endDate || runConfig.startDate);
+    const runState = this.executionEngine.createRunState({ strategy, runConfig });
+    const totalDays = daysBetweenInclusive(startDate, endDate);
+    const totalUnits = totalDays * 1000;
+    const dayResults = [];
+
+    forEachUtcDay(startDate, endDate, ({ dayStartMs, dayEndMs, isoDate, dayIndex }) => {
+      shouldStop?.();
+      const dayTrades = this.loadTrades({
+        symbol: strategy.market.symbol,
+        startMs: dayStartMs,
+        endMs: dayEndMs,
+        limit: null
+      });
+      const candles = enrichCandles(dayTrades, strategy.market.timeframe, runState.settings);
+
+      const fillModel = this.executionEngine.createFillModel({
+        syntheticSpreadBps: runState.settings.syntheticSpreadBps
+      });
+
+      candles.forEach((candle, candleIndex) => {
+        shouldStop?.();
+        this.executionEngine.processCandle({
+          strategy,
+          state: runState,
+          candle,
+          fillModel,
+          currentDateLabel: isoDate
+        });
+        const dayProgress = candles.length ? Math.floor(((candleIndex + 1) / candles.length) * 1000) : 1000;
+        progressCallback?.({
+          processed: dayIndex * 1000 + dayProgress,
+          total: totalUnits,
+          currentDate: isoDate,
+          totalTrades: runState.trades.length,
+          elapsedMs: Date.now() - Date.parse(runConfig.startedAtIso || new Date().toISOString()),
+          marker: `Simulating ${isoDate} · candle ${candleIndex + 1}/${candles.length}`,
+          dayIndex: dayIndex + 1,
+          totalDays
+        });
+      });
+
+      const endOfDayClose = this.executionEngine.finalizeDay({
+        strategy,
+        state: runState,
+        fillModel,
+        dateLabel: isoDate
+      });
+
+      dayResults.push({
+        date: isoDate,
+        tradeCount: runState.trades.filter((trade) => trade.entryDate === isoDate).length,
+        candleCount: candles.length,
+        endOfDayExit: endOfDayClose ? endOfDayClose.exitReason : null
+      });
     });
 
-    const candles = enrichCandles(trades, strategy.market.timeframe);
-    return this.executionEngine.run({ strategy: withRunConfig(strategy, runConfig), candles, progressCallback });
+    const result = this.executionEngine.finalizeRun({
+      strategy,
+      state: runState,
+      lastPrice: runState.session.previousCandle?.close || null
+    });
+
+    return {
+      ...result,
+      dayResults
+    };
   }
 }
 
-function withRunConfig(strategy, runConfig) {
-  return {
-    ...strategy,
-    backtestDefaults: {
-      ...strategy.backtestDefaults,
-      initial_balance: Number(runConfig.initialBalance || strategy.backtestDefaults.initial_balance)
-    }
-  };
-}
-
-function enrichCandles(trades, timeframe) {
+function enrichCandles(trades, timeframe, settings) {
   const candles = buildCandlesFromTrades(trades, timeframe);
   const vwap = new Map(computeSessionVwapFromTrades(trades, timeframe).map((x) => [x.time, x.value]));
   const cvd = new Map(computeSessionCvdFromTrades(trades, timeframe).map((x) => [x.time, x]));
@@ -61,7 +112,35 @@ function enrichCandles(trades, timeframe) {
       cvd_close: cvdCandle.close,
       dom_visible_buy_limits: bucket.buy,
       dom_visible_sell_limits: bucket.sell,
-      avg_volume_20: avgVolume20
+      avg_volume_20: avgVolume20,
+      stopLossPct: settings.stopLossPct,
+      takeProfitPct: settings.takeProfitPct
     };
   });
+}
+
+function normalizeDay(value) {
+  const date = new Date(value);
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+}
+
+function forEachUtcDay(startDate, endDate, callback) {
+  let cursor = startDate.getTime();
+  let dayIndex = 0;
+  while (cursor <= endDate.getTime()) {
+    const dayStartMs = cursor;
+    const dayEndMs = cursor + 86400000 - 1;
+    callback({
+      dayStartMs,
+      dayEndMs,
+      isoDate: new Date(dayStartMs).toISOString().slice(0, 10),
+      dayIndex
+    });
+    cursor += 86400000;
+    dayIndex += 1;
+  }
+}
+
+function daysBetweenInclusive(startDate, endDate) {
+  return Math.floor((endDate.getTime() - startDate.getTime()) / 86400000) + 1;
 }

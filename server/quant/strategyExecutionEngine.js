@@ -1,101 +1,221 @@
 import { RuleEvaluator } from './ruleEvaluator.js';
 import { MetricsCalculator } from './metricsCalculator.js';
 
+export const PAPER_EXECUTION_LIMITS = {
+  orderSizeMin: 0.0001,
+  orderSizeMax: 0.005,
+  orderSizeStep: 0.0001,
+  initialBalance: 10000,
+  maxReplaySpeed: 60
+};
+
+const DEFAULT_SYNTHETIC_SPREAD_BPS = 0.75;
+
 export class StrategyExecutionEngine {
   constructor({ ruleEvaluator = new RuleEvaluator(), metricsCalculator = new MetricsCalculator() } = {}) {
     this.ruleEvaluator = ruleEvaluator;
     this.metricsCalculator = metricsCalculator;
   }
 
-  run({ strategy, candles, progressCallback }) {
-    let equity = Number(strategy.backtestDefaults.initial_balance || 10000);
-    let peakEquity = equity;
-    const initialBalance = equity;
-    const trades = [];
-    const equitySeries = [];
-    let position = null;
-    let cooldownBars = 0;
+  createRunState({ strategy, runConfig = {} } = {}) {
+    const initialBalance = Number(runConfig.initialBalance || strategy.backtestDefaults?.initial_balance || PAPER_EXECUTION_LIMITS.initialBalance);
+    const orderSize = normalizeOrderSize(runConfig.orderSize);
 
-    for (let i = 1; i < candles.length; i += 1) {
-      const candle = candles[i];
-      const context = this.#buildContext(candles, i, position, strategy);
+    return {
+      initialBalance,
+      equity: initialBalance,
+      peakEquity: initialBalance,
+      orderSize,
+      settings: {
+        stopLossPct: Number(runConfig.stopLossPct ?? strategy.risk?.stop_loss_pct ?? 0.35),
+        takeProfitPct: Number(runConfig.takeProfitPct ?? strategy.risk?.take_profit_pct ?? 0.7),
+        enableLong: runConfig.enableLong ?? strategy.market?.allow_long ?? true,
+        enableShort: runConfig.enableShort ?? strategy.market?.allow_short ?? true,
+        syntheticSpreadBps: Number(runConfig.syntheticSpreadBps || DEFAULT_SYNTHETIC_SPREAD_BPS)
+      },
+      trades: [],
+      tradeLog: [],
+      equitySeries: [],
+      cumulativeRealizedSeries: [],
+      position: null,
+      lastProcessedCandleTime: null,
+      session: this.createSessionState()
+    };
+  }
 
-      if (position) {
-        position.holdingBars += 1;
-        if (strategy.positionManagement.enable_break_even && !position.breakEvenMoved) {
-          const profitPct = this.#positionPnlPct(position, candle.close);
-          if (profitPct >= strategy.positionManagement.move_stop_to_break_even_at_profit_pct) {
-            position.stopPrice = position.entryPrice;
-            position.breakEvenMoved = true;
-          }
-        }
+  createSessionState() {
+    return {
+      candles: [],
+      previousCandle: null,
+      cooldownBars: 0,
+      dayTradeCount: 0,
+      sessionDate: null
+    };
+  }
 
-        const sideExitRules = position.side === 'long' ? strategy.exitRules.long : strategy.exitRules.short;
-        if (this.ruleEvaluator.evaluateBlock(sideExitRules, context)) {
-          const closed = this.#closePosition(position, candle, strategy);
-          equity += closed.realizedPnl;
-          trades.push(closed);
-          position = null;
-          cooldownBars = strategy.execution.cooldown_bars_after_exit;
+  processCandle({ strategy, state, candle, fillModel, currentDateLabel }) {
+    const previousCandle = state.session.previousCandle || candle;
+    const context = this.#buildContext(candle, previousCandle, state.position, strategy);
+
+    if (state.position) {
+      state.position.holdingBars += 1;
+      if (strategy.positionManagement?.enable_break_even && !state.position.breakEvenMoved) {
+        const profitPct = this.#positionPnlPct(state.position, candle.close);
+        if (profitPct >= Number(strategy.positionManagement.move_stop_to_break_even_at_profit_pct || 0)) {
+          state.position.stopPrice = state.position.entryPrice;
+          state.position.breakEvenMoved = true;
         }
       }
 
-      if (!position && cooldownBars > 0) cooldownBars -= 1;
-
-      if (!position && cooldownBars === 0) {
-        const longSignal = strategy.market.allow_long && this.ruleEvaluator.evaluateBlock(strategy.entryRules.long, context);
-        const shortSignal = strategy.market.allow_short && this.ruleEvaluator.evaluateBlock(strategy.entryRules.short, context);
-
-        if (longSignal) position = this.#openPosition('long', candle, equity, strategy);
-        else if (shortSignal) position = this.#openPosition('short', candle, equity, strategy);
-      }
-
-      peakEquity = Math.max(peakEquity, equity);
-      const drawdownPct = peakEquity ? ((peakEquity - equity) / peakEquity) * 100 : 0;
-      equitySeries.push({ time: candle.time, equity: round(equity), drawdownPct: round(drawdownPct) });
-
-      if (progressCallback) {
-        progressCallback({ processed: i, total: candles.length - 1, marker: `Processed ${i}/${candles.length - 1} candles` });
+      const sideExitRules = state.position.side === 'long' ? strategy.exitRules.long : strategy.exitRules.short;
+      const exitReason = this.#resolveExitReason({ strategy, position: state.position, sideExitRules, context, candle });
+      if (exitReason) {
+        const exitPrice = fillModel.getExitPrice({ side: state.position.side, candle, reason: exitReason });
+        const closed = this.#closePosition({ position: state.position, candle, exitPrice, reason: exitReason });
+        state.equity += closed.realizedPnl;
+        state.trades.push(closed);
+        state.cumulativeRealizedSeries.push({
+          index: state.cumulativeRealizedSeries.length + 1,
+          time: closed.exitTime,
+          cumulativeRealizedPnl: round(state.trades.reduce((sum, trade) => sum + trade.realizedPnl, 0))
+        });
+        state.tradeLog.unshift(buildTradeLogRow(closed, 'EXIT'));
+        state.position = null;
+        state.session.cooldownBars = Number(strategy.execution?.cooldown_bars_after_exit || 0);
+        state.session.dayTradeCount += 1;
       }
     }
 
+    if (!state.position && state.session.cooldownBars > 0) {
+      state.session.cooldownBars -= 1;
+    }
+
+    if (!state.position && state.session.cooldownBars === 0) {
+      const longSignal = state.settings.enableLong && strategy.market.allow_long && this.ruleEvaluator.evaluateBlock(strategy.entryRules.long, context);
+      const shortSignal = state.settings.enableShort && strategy.market.allow_short && this.ruleEvaluator.evaluateBlock(strategy.entryRules.short, context);
+
+      if (longSignal) {
+        const entryPrice = fillModel.getEntryPrice({ side: 'long', candle });
+        state.position = this.#openPosition({ side: 'long', candle, entryPrice, quantity: state.orderSize, signalReason: 'Long signal confirmed.' });
+        state.tradeLog.unshift(buildTradeLogRow(state.position, 'BUY'));
+      } else if (shortSignal) {
+        const entryPrice = fillModel.getEntryPrice({ side: 'short', candle });
+        state.position = this.#openPosition({ side: 'short', candle, entryPrice, quantity: state.orderSize, signalReason: 'Short signal confirmed.' });
+        state.tradeLog.unshift(buildTradeLogRow(state.position, 'SELL'));
+      }
+    }
+
+    const drawdownPct = this.#pushEquityPoint(state, candle.time, currentDateLabel);
+    state.lastProcessedCandleTime = candle.time;
+    state.session.candles.push(candle);
+    state.session.previousCandle = candle;
+
+    return {
+      equity: round(state.equity),
+      drawdownPct,
+      tradeCount: state.trades.length,
+      openPosition: state.position,
+      lastProcessedCandleTime: state.lastProcessedCandleTime
+    };
+  }
+
+  finalizeDay({ strategy, state, fillModel, dateLabel }) {
+    if (!state.position) {
+      state.session = this.createSessionState();
+      state.session.sessionDate = dateLabel;
+      return null;
+    }
+
+    const finalCandle = state.session.previousCandle;
+    const exitPrice = fillModel.getExitPrice({ side: state.position.side, candle: finalCandle, reason: 'end_of_day_exit' });
+    const closed = this.#closePosition({
+      position: state.position,
+      candle: finalCandle,
+      exitPrice,
+      reason: 'end_of_day_exit'
+    });
+
+    state.equity += closed.realizedPnl;
+    state.trades.push(closed);
+    state.cumulativeRealizedSeries.push({
+      index: state.cumulativeRealizedSeries.length + 1,
+      time: closed.exitTime,
+      cumulativeRealizedPnl: round(state.trades.reduce((sum, trade) => sum + trade.realizedPnl, 0))
+    });
+    state.tradeLog.unshift(buildTradeLogRow(closed, 'EXIT'));
+    state.position = null;
+    this.#pushEquityPoint(state, finalCandle.time, dateLabel);
+    state.session = this.createSessionState();
+    state.session.sessionDate = dateLabel;
+    return closed;
+  }
+
+  finalizeRun({ strategy, state, lastPrice = null }) {
     const metrics = this.metricsCalculator.calculate({
-      initialBalance,
-      equitySeries,
-      trades,
-      openPosition: position,
-      lastPrice: candles.at(-1)?.close
+      initialBalance: state.initialBalance,
+      equitySeries: state.equitySeries,
+      trades: state.trades,
+      openPosition: state.position,
+      lastPrice,
+      cumulativeRealizedSeries: state.cumulativeRealizedSeries
     });
 
     return {
       metrics,
-      equitySeries,
-      drawdownSeries: equitySeries.map((point) => ({ time: point.time, drawdownPct: point.drawdownPct })),
-      trades,
+      equitySeries: state.equitySeries,
+      drawdownSeries: state.equitySeries.map((point) => ({ time: point.time, drawdownPct: point.drawdownPct })),
+      trades: state.trades,
+      tradeLog: state.tradeLog,
+      cumulativePnlSeries: state.cumulativeRealizedSeries,
       endingBalance: metrics.currentEquity,
-      initialBalance
+      initialBalance: state.initialBalance,
+      analyses: this.metricsCalculator.buildAnalyses({ trades: state.trades })
     };
   }
 
-  #buildContext(candles, index, position, strategy) {
-    const candle = candles[index];
-    const prev = candles[index - 1] || candle;
+  createFillModel({ syntheticSpreadBps = DEFAULT_SYNTHETIC_SPREAD_BPS, quoteResolver } = {}) {
+    return {
+      getEntryPrice: ({ side, candle }) => {
+        const quote = quoteResolver?.(candle) || buildSyntheticQuote(candle, syntheticSpreadBps);
+        return side === 'long' ? quote.ask : quote.bid;
+      },
+      getExitPrice: ({ side, candle }) => {
+        const quote = quoteResolver?.(candle) || buildSyntheticQuote(candle, syntheticSpreadBps);
+        return side === 'long' ? quote.bid : quote.ask;
+      }
+    };
+  }
+
+  #pushEquityPoint(state, candleTime, currentDateLabel) {
+    state.peakEquity = Math.max(state.peakEquity, state.equity);
+    const drawdownPct = state.peakEquity ? ((state.peakEquity - state.equity) / state.peakEquity) * 100 : 0;
+    state.equitySeries.push({
+      time: candleTime,
+      equity: round(state.equity),
+      drawdownPct: round(drawdownPct),
+      date: currentDateLabel
+    });
+
+    return round(drawdownPct);
+  }
+
+  #buildContext(candle, previousCandle, position, strategy) {
     const values = {
       open: candle.open,
       high: candle.high,
       low: candle.low,
       close: candle.close,
       volume: candle.volume,
-      prev_close: prev.close,
-      prev_high: prev.high,
-      prev_low: prev.low,
-      prev_volume: prev.volume,
+      prev_close: previousCandle.close,
+      prev_high: previousCandle.high,
+      prev_low: previousCandle.low,
+      prev_volume: previousCandle.volume,
       vwap_session: candle.vwap_session,
       cvd_open: candle.cvd_open,
       cvd_high: candle.cvd_high,
       cvd_low: candle.cvd_low,
       cvd_close: candle.cvd_close,
-      prev_cvd_close: prev.cvd_close,
+      prev_cvd_close: previousCandle.cvd_close,
       dom_visible_buy_limits: candle.dom_visible_buy_limits,
       dom_visible_sell_limits: candle.dom_visible_sell_limits,
       avg_volume_20: candle.avg_volume_20
@@ -115,60 +235,66 @@ export class StrategyExecutionEngine {
         builtin.stop_loss = candle.close >= position.stopPrice;
         builtin.take_profit = candle.close <= position.takeProfitPrice;
       }
-      builtin.max_holding_bars = position.holdingBars >= strategy.risk.max_holding_bars;
+      builtin.max_holding_bars = position.holdingBars >= Number(strategy.risk?.max_holding_bars || 1);
     }
 
     return { values, builtin };
   }
 
-  #openPosition(side, candle, equity, strategy) {
-    const slippagePct = strategy.risk.slippage_pct_per_side / 100;
-    const close = candle.close;
-    const entryPrice = side === 'long' ? close * (1 + slippagePct) : close * (1 - slippagePct);
-    const notional = equity * (strategy.risk.position_size_pct_of_equity / 100);
-    const quantity = notional / entryPrice;
-    const stopMult = strategy.risk.stop_loss_pct / 100;
-    const tpMult = strategy.risk.take_profit_pct / 100;
+  #resolveExitReason({ position, sideExitRules, context }) {
+    const wrapper = sideExitRules?.all ? 'all' : 'any';
+    const conditions = sideExitRules?.[wrapper] || [];
+    const evaluations = conditions.map((condition) => ({
+      condition,
+      matched: this.ruleEvaluator.evaluateCondition(condition, context)
+    }));
 
+    const triggered = wrapper === 'all'
+      ? evaluations.length > 0 && evaluations.every((entry) => entry.matched)
+      : evaluations.some((entry) => entry.matched);
+
+    if (!triggered) return null;
+    const builtinMatch = evaluations.find((entry) => entry.matched && entry.condition.type);
+    return builtinMatch?.condition.type || 'signal_exit';
+  }
+
+  #openPosition({ side, candle, entryPrice, quantity, signalReason }) {
     return {
       status: 'open',
       side,
-      entryTime: candle.time,
-      entryPrice,
-      quantity,
-      notional,
-      entryNotional: entryPrice * quantity,
-      feesPaid: entryPrice * quantity * (strategy.risk.fee_pct_per_side / 100),
-      slippagePaid: Math.abs(entryPrice - close) * quantity,
+      quantity: normalizeOrderSize(quantity),
+      entryTime: candle.time * 1000,
+      entryCandleTime: candle.time,
+      entryPrice: round(entryPrice),
+      entryReason: signalReason,
+      entryDate: new Date(candle.time * 1000).toISOString().slice(0, 10),
       holdingBars: 0,
       breakEvenMoved: false,
-      stopPrice: side === 'long' ? entryPrice * (1 - stopMult) : entryPrice * (1 + stopMult),
-      takeProfitPrice: side === 'long' ? entryPrice * (1 + tpMult) : entryPrice * (1 - tpMult)
+      stopPrice: side === 'long'
+        ? round(entryPrice * (1 - Number(candle.stopLossPct ?? 0.35) / 100))
+        : round(entryPrice * (1 + Number(candle.stopLossPct ?? 0.35) / 100)),
+      takeProfitPrice: side === 'long'
+        ? round(entryPrice * (1 + Number(candle.takeProfitPct ?? 0.7) / 100))
+        : round(entryPrice * (1 - Number(candle.takeProfitPct ?? 0.7) / 100))
     };
   }
 
-  #closePosition(position, candle, strategy) {
-    const slippagePct = strategy.risk.slippage_pct_per_side / 100;
-    const close = candle.close;
-    const exitPrice = position.side === 'long' ? close * (1 - slippagePct) : close * (1 + slippagePct);
-    const exitNotional = exitPrice * position.quantity;
-    const exitFees = exitNotional * (strategy.risk.fee_pct_per_side / 100);
-    const grossPnl = position.side === 'long'
+  #closePosition({ position, candle, exitPrice, reason }) {
+    const realizedPnl = position.side === 'long'
       ? (exitPrice - position.entryPrice) * position.quantity
       : (position.entryPrice - exitPrice) * position.quantity;
-    const realizedPnl = grossPnl - position.feesPaid - exitFees;
 
     return {
       ...position,
       status: 'closed',
-      exitTime: candle.time,
-      exitPrice,
-      fees: position.feesPaid + exitFees,
-      slippage: position.slippagePaid + Math.abs(exitPrice - close) * position.quantity,
+      exitTime: candle.time * 1000,
+      exitPrice: round(exitPrice),
       realizedPnl: round(realizedPnl),
-      returnPct: round((realizedPnl / position.entryNotional) * 100),
-      exitReason: 'rule_exit',
-      holdingBars: position.holdingBars
+      returnPct: round((realizedPnl / Math.max(position.entryPrice * position.quantity, 1e-9)) * 100),
+      exitReason: reason,
+      holdingBars: position.holdingBars,
+      durationMs: Math.max(candle.time * 1000 - position.entryTime, 60000),
+      durationMinutes: Math.max((candle.time * 1000 - position.entryTime) / 60000, 1)
     };
   }
 
@@ -176,8 +302,38 @@ export class StrategyExecutionEngine {
     const pnl = position.side === 'long'
       ? (markPrice - position.entryPrice) * position.quantity
       : (position.entryPrice - markPrice) * position.quantity;
-    return (pnl / Math.max(position.entryNotional, 1e-9)) * 100;
+    return (pnl / Math.max(position.entryPrice * position.quantity, 1e-9)) * 100;
   }
+}
+
+function buildSyntheticQuote(candle, syntheticSpreadBps) {
+  const mid = Number(candle.close || candle.open || 0);
+  const halfSpread = mid * (syntheticSpreadBps / 10000 / 2);
+  return {
+    bid: round(mid - halfSpread),
+    ask: round(mid + halfSpread)
+  };
+}
+
+function buildTradeLogRow(trade, action) {
+  return {
+    id: `${action}-${trade.entryTime}-${trade.exitTime || trade.entryTime}`,
+    timestamp: action === 'EXIT' ? trade.exitTime : trade.entryTime,
+    action,
+    side: trade.side,
+    size: trade.quantity,
+    fillPrice: action === 'EXIT' ? trade.exitPrice : trade.entryPrice,
+    reason: action === 'EXIT' ? trade.exitReason : trade.entryReason,
+    resultingPosition: action === 'EXIT' ? 'Flat' : `${trade.side} ${trade.quantity.toFixed(4)}`,
+    realizedPnl: action === 'EXIT' ? trade.realizedPnl : null
+  };
+}
+
+function normalizeOrderSize(value) {
+  const numeric = Number(value || PAPER_EXECUTION_LIMITS.orderSizeMin);
+  const clamped = Math.min(PAPER_EXECUTION_LIMITS.orderSizeMax, Math.max(PAPER_EXECUTION_LIMITS.orderSizeMin, numeric));
+  const steps = Math.round(clamped / PAPER_EXECUTION_LIMITS.orderSizeStep);
+  return Number((steps * PAPER_EXECUTION_LIMITS.orderSizeStep).toFixed(4));
 }
 
 function round(value) {

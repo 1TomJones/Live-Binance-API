@@ -234,6 +234,14 @@ export function getQuantStrategyById(id) {
   return db.prepare('SELECT * FROM quant_strategies WHERE id = ?').get(id);
 }
 
+export function listQuantStrategies(limit = 100) {
+  return db.prepare(`
+    SELECT * FROM quant_strategies
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(limit);
+}
+
 export function createQuantBacktestJob(record) {
   const now = Date.now();
   const info = createJobStmt.run({ ...record, created_at: now, updated_at: now });
