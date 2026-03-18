@@ -3,7 +3,19 @@ async function request(url, options = {}) {
     headers: { 'Content-Type': 'application/json' },
     ...options
   });
-  const data = await response.json();
+
+  const contentType = response.headers.get('content-type') || '';
+  const isJson = contentType.includes('application/json');
+  const payload = isJson ? await response.json() : await response.text();
+
+  if (!isJson) {
+    const snippet = String(payload).replace(/\s+/g, ' ').trim().slice(0, 120);
+    throw new Error(
+      `Expected JSON from ${url}, but received ${contentType || 'an unknown response type'}${snippet ? `: ${snippet}` : ''}`
+    );
+  }
+
+  const data = payload;
   if (!response.ok) {
     throw new Error(data.error || data.validation?.errors?.join(', ') || 'Request failed');
   }
