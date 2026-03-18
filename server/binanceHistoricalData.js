@@ -14,6 +14,29 @@ export class NonRetryableBinanceRequestError extends Error {
   }
 }
 
+export class RetryableBinanceRequestError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = 'RetryableBinanceRequestError';
+    this.details = details;
+  }
+}
+
+function extractRetryAfterMs(responseBody = '') {
+  const bannedUntilMatch = String(responseBody).match(/banned until\s+(\d{10,})/i);
+  if (bannedUntilMatch) {
+    const bannedUntilMs = Number(bannedUntilMatch[1]);
+    const remainingMs = bannedUntilMs - Date.now();
+    return remainingMs > 0 ? remainingMs : 0;
+  }
+
+  return null;
+}
+
+function shouldRetryAcrossMirrors(status) {
+  return status === 418 || status === 429;
+}
+
 export async function fetchBinanceWithFallback(endpointPath, search, { timeoutMs = 10000, context = 'binance-request', baseUrls = BINANCE_REST_BASES } = {}) {
   const params = Object.fromEntries(search.entries());
   let lastFailure = null;
@@ -37,11 +60,16 @@ export async function fetchBinanceWithFallback(endpointPath, search, { timeoutMs
           baseUrl,
           endpointPath,
           params,
-          responseBody
+          responseBody,
+          retryAfterMs: extractRetryAfterMs(responseBody)
         };
 
         console.error(`[${context}] non-200 response from Binance`, failure);
         lastFailure = failure;
+
+        if (shouldRetryAcrossMirrors(response.status)) {
+          continue;
+        }
 
         if (response.status >= 400 && response.status < 500) {
           const message = responseBody || `HTTP ${response.status}`;
@@ -71,6 +99,17 @@ export async function fetchBinanceWithFallback(endpointPath, search, { timeoutMs
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  const retryAfterMs = lastFailure?.retryAfterMs ?? null;
+  if (lastFailure?.status && shouldRetryAcrossMirrors(lastFailure.status)) {
+    throw new RetryableBinanceRequestError(
+      `Binance ${endpointPath} request rate-limited across all configured endpoints.`,
+      {
+        ...lastFailure,
+        retryAfterMs
+      }
+    );
   }
 
   throw new Error(
