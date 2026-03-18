@@ -1,5 +1,6 @@
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
+import { UI_REFRESH_INTERVALS_MS } from '../constants/uiPerformance.js';
 
 let lightweightChartsLoader = null;
 const chartSocket = io();
@@ -26,6 +27,80 @@ function loadLightweightCharts() {
   return lightweightChartsLoader;
 }
 
+function getLastPoint(series = []) {
+  return series.length ? series[series.length - 1] : null;
+}
+
+function getSeriesSignature(series = []) {
+  const first = series[0];
+  const last = series[series.length - 1];
+  return `${series.length}:${first?.time ?? 'na'}:${last?.time ?? 'na'}`;
+}
+
+function syncLineSeries(seriesApi, nextSeries, cacheRef) {
+  if (!seriesApi) return;
+
+  const previousSeries = cacheRef.current;
+  if (!previousSeries.length || !nextSeries.length) {
+    seriesApi.setData(nextSeries);
+    cacheRef.current = nextSeries;
+    return;
+  }
+
+  const previousLast = getLastPoint(previousSeries);
+  const nextLast = getLastPoint(nextSeries);
+  const appended = nextSeries.length === previousSeries.length + 1;
+  const updatedTail = nextSeries.length === previousSeries.length;
+
+  if (updatedTail && previousLast?.time === nextLast?.time) {
+    seriesApi.update(nextLast);
+    cacheRef.current = nextSeries;
+    return;
+  }
+
+  if (appended && previousLast?.time === nextSeries[nextSeries.length - 2]?.time) {
+    seriesApi.update(nextSeries[nextSeries.length - 2]);
+    seriesApi.update(nextLast);
+    cacheRef.current = nextSeries;
+    return;
+  }
+
+  seriesApi.setData(nextSeries);
+  cacheRef.current = nextSeries;
+}
+
+function syncCandleSeries(seriesApi, nextSeries, cacheRef) {
+  if (!seriesApi) return;
+
+  const previousSeries = cacheRef.current;
+  if (!previousSeries.length || !nextSeries.length) {
+    seriesApi.setData(nextSeries);
+    cacheRef.current = nextSeries;
+    return;
+  }
+
+  const previousLast = getLastPoint(previousSeries);
+  const nextLast = getLastPoint(nextSeries);
+  const appended = nextSeries.length === previousSeries.length + 1;
+  const updatedTail = nextSeries.length === previousSeries.length;
+
+  if (updatedTail && previousLast?.time === nextLast?.time) {
+    seriesApi.update(nextLast);
+    cacheRef.current = nextSeries;
+    return;
+  }
+
+  if (appended && previousLast?.time === nextSeries[nextSeries.length - 2]?.time) {
+    seriesApi.update(nextSeries[nextSeries.length - 2]);
+    seriesApi.update(nextLast);
+    cacheRef.current = nextSeries;
+    return;
+  }
+
+  seriesApi.setData(nextSeries);
+  cacheRef.current = nextSeries;
+}
+
 function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
   const containerRef = useRef(null);
   const overlayCanvasRef = useRef(null);
@@ -37,26 +112,45 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
   const vwapSeriesRef = useRef(null);
   const lowerChartRef = useRef(null);
   const cvdSeriesRef = useRef(null);
-  const profileRef = useRef([]);
   const indicatorsRef = useRef(defaultIndicators);
+  const timeScaleSyncHandlerRef = useRef(null);
 
-  const snapshotRefreshTimerRef = useRef(null);
-  const profileRefreshTimerRef = useRef(null);
+  const profileRef = useRef([]);
+  const drawFrameRef = useRef(0);
+  const snapshotTimerRef = useRef(null);
+  const profileTimerRef = useRef(null);
+  const activeSnapshotAbortRef = useRef(null);
+  const activeProfileAbortRef = useRef(null);
+  const snapshotRequestSeqRef = useRef(0);
+  const profileRequestSeqRef = useRef(0);
+  const refreshQueuedRef = useRef(false);
+  const profileQueuedRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  const candleDataRef = useRef([]);
+  const vwapDataRef = useRef([]);
+  const cvdDataRef = useRef([]);
+  const snapshotSignatureRef = useRef('');
+  const vwapSignatureRef = useRef('');
+  const cvdSignatureRef = useRef('');
+  const refreshSessionSnapshotRef = useRef(null);
 
   const [timeframe, setTimeframe] = useState('1m');
   const [menuOpen, setMenuOpen] = useState(false);
   const [indicators, setIndicators] = useState(defaultIndicators);
-  const [profile, setProfile] = useState([]);
 
   const showLowerPanel = indicators.cvd;
 
   useEffect(() => {
-    profileRef.current = profile;
-  }, [profile]);
-
-  useEffect(() => {
     indicatorsRef.current = indicators;
   }, [indicators]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const compactLabel = useMemo(() => {
     const enabled = Object.entries(indicators).filter(([, value]) => value).map(([key]) => key);
@@ -140,63 +234,142 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
     });
   }, [getVolumeProfilePaneBounds]);
 
-  const refreshVolumeProfile = useCallback(async () => {
-    if (!indicators.volumeProfile) {
-      setProfile([]);
+  const scheduleVolumeProfileDraw = useCallback(() => {
+    if (drawFrameRef.current) window.cancelAnimationFrame(drawFrameRef.current);
+    drawFrameRef.current = window.requestAnimationFrame(() => {
+      drawFrameRef.current = 0;
+      drawVolumeProfile();
+    });
+  }, [drawVolumeProfile]);
+
+  const refreshVolumeProfile = useCallback(async ({ immediate = false } = {}) => {
+    if (!indicatorsRef.current.volumeProfile) {
+      profileRef.current = [];
       clearVolumeProfile();
       return;
     }
 
-    const response = await fetch(`/api/indicators/volume-profile?timeframe=${timeframe}`);
-    const payload = await response.json();
-    setProfile(payload.profile || []);
-  }, [clearVolumeProfile, indicators.volumeProfile, timeframe]);
-
-  const refreshSessionSnapshot = useCallback(async ({ fit = false } = {}) => {
-    const response = await fetch(`/api/session/snapshot?timeframe=${timeframe}`);
-    const payload = await response.json();
-
-    const candles = (payload.candles || []).map(({ time, open, high, low, close, isPlaceholder }) => {
-      if (isPlaceholder || !Number.isFinite(open) || !Number.isFinite(close)) return { time };
-      return { time, open, high, low, close };
-    });
-    candleSeriesRef.current?.setData(candles);
-
-    if (indicators.vwap) {
-      const vwapSeries = (payload.vwap || []).map(({ time, value }) => ({ time, value }));
-      vwapSeriesRef.current?.setData(vwapSeries);
+    if (activeProfileAbortRef.current && !immediate) {
+      profileQueuedRef.current = true;
+      return;
     }
 
-    if (indicators.cvd) {
-      const cvdCandles = (payload.cvd || []).map(({ time, open, high, low, close }) => ({ time, open, high, low, close }));
-      cvdSeriesRef.current?.setData(cvdCandles);
+    profileQueuedRef.current = false;
+    activeProfileAbortRef.current?.abort();
+    const controller = new AbortController();
+    activeProfileAbortRef.current = controller;
+    const requestSeq = ++profileRequestSeqRef.current;
+
+    try {
+      const response = await fetch(`/api/indicators/volume-profile?timeframe=${timeframe}`, { signal: controller.signal });
+      const payload = await response.json();
+      if (!mountedRef.current || controller.signal.aborted || requestSeq !== profileRequestSeqRef.current) return;
+      profileRef.current = payload.profile || [];
+      scheduleVolumeProfileDraw();
+    } catch (error) {
+      if (error?.name !== 'AbortError') {
+        console.error('[volume-profile] refresh failed', error);
+      }
+    } finally {
+      if (activeProfileAbortRef.current === controller) {
+        activeProfileAbortRef.current = null;
+      }
+
+      if (profileQueuedRef.current && mountedRef.current) {
+        profileQueuedRef.current = false;
+        refreshVolumeProfile({ immediate: true });
+      }
+    }
+  }, [clearVolumeProfile, scheduleVolumeProfileDraw, timeframe]);
+
+  const refreshSessionSnapshot = useCallback(async ({ fit = false, immediate = false } = {}) => {
+    if (activeSnapshotAbortRef.current && !immediate) {
+      refreshQueuedRef.current = true;
+      return;
     }
 
-    if (import.meta.env.DEV && payload.debug) {
-      console.debug('[session/snapshot]', {
-        timeframe,
-        candles: payload.debug.sessionCandleCount,
-        hydrated: payload.debug.hydratedCandleCount,
-        placeholders: payload.debug.placeholderCandleCount,
-        realOhlcVariance: payload.debug.realOhlcVariance,
-        hydrationStatus: payload.debug.hydration?.status,
-        counts: payload.debug.timeframeCounts,
-        sessionStartIso: payload.sessionStartIso,
-        vwapHasVariance: payload.debug.vwapHasVariance,
-        cvdBarsWithTrades: payload.debug.cvdBarsWithTrades
+    refreshQueuedRef.current = false;
+    activeSnapshotAbortRef.current?.abort();
+    const controller = new AbortController();
+    activeSnapshotAbortRef.current = controller;
+    const requestSeq = ++snapshotRequestSeqRef.current;
+
+    try {
+      const response = await fetch(`/api/session/snapshot?timeframe=${timeframe}`, { signal: controller.signal });
+      const payload = await response.json();
+      if (!mountedRef.current || controller.signal.aborted || requestSeq !== snapshotRequestSeqRef.current) return;
+
+      const candles = (payload.candles || []).map(({ time, open, high, low, close, isPlaceholder }) => {
+        if (isPlaceholder || !Number.isFinite(open) || !Number.isFinite(close)) return { time };
+        return { time, open, high, low, close };
       });
-    }
 
-    if (fit) chartRef.current?.timeScale().fitContent();
-    drawVolumeProfile();
-  }, [drawVolumeProfile, indicators.cvd, indicators.vwap, timeframe]);
+      const candleSignature = getSeriesSignature(candles);
+      if (fit || candleSignature !== snapshotSignatureRef.current || getLastPoint(candleDataRef.current)?.close !== getLastPoint(candles)?.close) {
+        syncCandleSeries(candleSeriesRef.current, candles, candleDataRef);
+        snapshotSignatureRef.current = candleSignature;
+      }
+
+      if (indicatorsRef.current.vwap) {
+        const vwapSeries = (payload.vwap || []).map(({ time, value }) => ({ time, value }));
+        const nextSignature = getSeriesSignature(vwapSeries);
+        if (fit || nextSignature !== vwapSignatureRef.current || getLastPoint(vwapDataRef.current)?.value !== getLastPoint(vwapSeries)?.value) {
+          syncLineSeries(vwapSeriesRef.current, vwapSeries, vwapDataRef);
+          vwapSignatureRef.current = nextSignature;
+        }
+      }
+
+      if (indicatorsRef.current.cvd) {
+        const cvdCandles = (payload.cvd || []).map(({ time, open, high, low, close }) => ({ time, open, high, low, close }));
+        const nextSignature = getSeriesSignature(cvdCandles);
+        if (fit || nextSignature !== cvdSignatureRef.current || getLastPoint(cvdDataRef.current)?.close !== getLastPoint(cvdCandles)?.close) {
+          syncCandleSeries(cvdSeriesRef.current, cvdCandles, cvdDataRef);
+          cvdSignatureRef.current = nextSignature;
+        }
+      }
+
+      if (import.meta.env.DEV && payload.debug) {
+        console.debug('[session/snapshot]', {
+          timeframe,
+          candles: payload.debug.sessionCandleCount,
+          hydrated: payload.debug.hydratedCandleCount,
+          placeholders: payload.debug.placeholderCandleCount,
+          realOhlcVariance: payload.debug.realOhlcVariance,
+          hydrationStatus: payload.debug.hydration?.status,
+          counts: payload.debug.timeframeCounts,
+          sessionStartIso: payload.sessionStartIso,
+          vwapHasVariance: payload.debug.vwapHasVariance,
+          cvdBarsWithTrades: payload.debug.cvdBarsWithTrades
+        });
+      }
+
+      if (fit) chartRef.current?.timeScale().fitContent();
+      scheduleVolumeProfileDraw();
+    } catch (error) {
+      if (error?.name !== 'AbortError') {
+        console.error('[session/snapshot] refresh failed', error);
+      }
+    } finally {
+      if (activeSnapshotAbortRef.current === controller) {
+        activeSnapshotAbortRef.current = null;
+      }
+
+      if (refreshQueuedRef.current && mountedRef.current) {
+        refreshQueuedRef.current = false;
+        refreshSessionSnapshot({ immediate: true });
+      }
+    }
+  }, [scheduleVolumeProfileDraw, timeframe]);
 
   useEffect(() => {
-    let mounted = true;
+    refreshSessionSnapshotRef.current = refreshSessionSnapshot;
+  }, [refreshSessionSnapshot]);
+
+  useEffect(() => {
     let resizeObserver;
 
     loadLightweightCharts().then((lib) => {
-      if (!mounted || !containerRef.current || !lib) return;
+      if (!mountedRef.current || !containerRef.current || !lib) return;
 
       const chart = lib.createChart(containerRef.current, {
         autoSize: true,
@@ -217,7 +390,7 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
       vwapSeriesRef.current = vwapSeries;
 
       resizeObserver = new ResizeObserver(() => {
-        drawVolumeProfile();
+        scheduleVolumeProfileDraw();
       });
       resizeObserver.observe(chartFrameRef.current || containerRef.current);
 
@@ -241,77 +414,115 @@ function CandlestickChartComponent({ symbol = 'BTCUSDT' }) {
           priceLineVisible: false
         });
 
-        chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+        const syncLowerChart = (range) => {
           lowerChart.timeScale().setVisibleLogicalRange(range);
-        });
+        };
+
+        chart.timeScale().subscribeVisibleLogicalRangeChange(syncLowerChart);
+        timeScaleSyncHandlerRef.current = syncLowerChart;
 
         lowerChartRef.current = lowerChart;
         cvdSeriesRef.current = cvdSeries;
       }
 
-      refreshSessionSnapshot({ fit: true });
+      refreshSessionSnapshotRef.current?.({ fit: true, immediate: true });
     }).catch(() => {});
 
     return () => {
-      mounted = false;
       resizeObserver?.disconnect();
+      if (timeScaleSyncHandlerRef.current && chartRef.current) {
+        chartRef.current.timeScale().unsubscribeVisibleLogicalRangeChange(timeScaleSyncHandlerRef.current);
+      }
+      if (drawFrameRef.current) window.cancelAnimationFrame(drawFrameRef.current);
+      activeSnapshotAbortRef.current?.abort();
+      activeProfileAbortRef.current?.abort();
       chartRef.current?.remove();
       lowerChartRef.current?.remove();
       chartRef.current = null;
       lowerChartRef.current = null;
+      candleSeriesRef.current = null;
+      vwapSeriesRef.current = null;
+      cvdSeriesRef.current = null;
+      timeScaleSyncHandlerRef.current = null;
     };
-  }, []);
+  }, [scheduleVolumeProfileDraw]);
 
   useEffect(() => {
-    refreshSessionSnapshot({ fit: true });
-  }, [refreshSessionSnapshot, timeframe]);
+    candleDataRef.current = [];
+    vwapDataRef.current = [];
+    cvdDataRef.current = [];
+    snapshotSignatureRef.current = '';
+    vwapSignatureRef.current = '';
+    cvdSignatureRef.current = '';
+    refreshSessionSnapshot({ fit: true, immediate: true });
+  }, [refreshSessionSnapshot]);
 
   useEffect(() => {
     if (!vwapSeriesRef.current) return;
     vwapSeriesRef.current.applyOptions({ visible: indicators.vwap });
-    if (!indicators.vwap) vwapSeriesRef.current.setData([]);
-    refreshSessionSnapshot();
+    if (!indicators.vwap) {
+      vwapSeriesRef.current.setData([]);
+      vwapDataRef.current = [];
+      vwapSignatureRef.current = '';
+      return;
+    }
+    refreshSessionSnapshot({ immediate: true });
   }, [indicators.vwap, refreshSessionSnapshot]);
 
   useEffect(() => {
     if (!cvdSeriesRef.current) return;
     cvdSeriesRef.current.applyOptions({ visible: indicators.cvd });
-    if (!indicators.cvd) cvdSeriesRef.current.setData([]);
-    refreshSessionSnapshot();
+    if (!indicators.cvd) {
+      cvdSeriesRef.current.setData([]);
+      cvdDataRef.current = [];
+      cvdSignatureRef.current = '';
+      return;
+    }
+    refreshSessionSnapshot({ immediate: true });
   }, [indicators.cvd, refreshSessionSnapshot]);
 
   useEffect(() => {
-    refreshVolumeProfile();
-  }, [refreshVolumeProfile]);
+    if (!indicators.volumeProfile) {
+      profileRef.current = [];
+      clearVolumeProfile();
+      return;
+    }
+    refreshVolumeProfile({ immediate: true });
+  }, [clearVolumeProfile, indicators.volumeProfile, refreshVolumeProfile]);
 
   useEffect(() => {
-    drawVolumeProfile();
-  }, [drawVolumeProfile, indicators.volumeProfile, profile]);
+    scheduleVolumeProfileDraw();
+  }, [scheduleVolumeProfileDraw, showLowerPanel]);
 
   useEffect(() => {
+    const scheduleSnapshotRefresh = () => {
+      if (snapshotTimerRef.current) return;
+      snapshotTimerRef.current = window.setTimeout(() => {
+        snapshotTimerRef.current = null;
+        refreshSessionSnapshot();
+      }, UI_REFRESH_INTERVALS_MS.chartSnapshot);
+    };
+
+    const scheduleProfileRefresh = () => {
+      if (!indicatorsRef.current.volumeProfile || profileTimerRef.current) return;
+      profileTimerRef.current = window.setTimeout(() => {
+        profileTimerRef.current = null;
+        refreshVolumeProfile();
+      }, UI_REFRESH_INTERVALS_MS.volumeProfile);
+    };
+
     const onTrade = () => {
-      if (!snapshotRefreshTimerRef.current) {
-        snapshotRefreshTimerRef.current = window.setTimeout(() => {
-          snapshotRefreshTimerRef.current = null;
-          refreshSessionSnapshot();
-        }, 250);
-      }
-
-      if (indicators.volumeProfile && !profileRefreshTimerRef.current) {
-        profileRefreshTimerRef.current = window.setTimeout(() => {
-          profileRefreshTimerRef.current = null;
-          refreshVolumeProfile();
-        }, 250);
-      }
+      scheduleSnapshotRefresh();
+      scheduleProfileRefresh();
     };
 
     chartSocket.on('trade', onTrade);
     return () => {
       chartSocket.off('trade', onTrade);
-      if (snapshotRefreshTimerRef.current) window.clearTimeout(snapshotRefreshTimerRef.current);
-      if (profileRefreshTimerRef.current) window.clearTimeout(profileRefreshTimerRef.current);
+      if (snapshotTimerRef.current) window.clearTimeout(snapshotTimerRef.current);
+      if (profileTimerRef.current) window.clearTimeout(profileTimerRef.current);
     };
-  }, [indicators.volumeProfile, refreshSessionSnapshot, refreshVolumeProfile]);
+  }, [refreshSessionSnapshot, refreshVolumeProfile]);
 
   return (
     <div className="chart-wrap">

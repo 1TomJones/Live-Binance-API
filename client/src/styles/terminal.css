@@ -97,7 +97,7 @@ body { margin: 0; background: #060b13; }
   font-variant-numeric: tabular-nums;
 }
 .book-columns { color: #728cb8; border-bottom: 1px solid #1a263d; }
-.book-scroll { overflow-y: auto; min-height: 0; }
+.book-scroll { overflow-y: auto; min-height: 0; contain: strict; }
 .book-row {
   position: relative;
   border-bottom: 1px solid rgba(26, 38, 61, 0.4);
@@ -178,7 +178,7 @@ body { margin: 0; background: #060b13; }
   color: #a8bddf;
 }
 .indicator-menu input { margin: 0; accent-color: #4c74b3; }
-.tv-chart-frame { position: relative; flex: 1; min-height: 0; border: 1px solid #1a263d; }
+.tv-chart-frame { position: relative; flex: 1; min-height: 0; border: 1px solid #1a263d; contain: layout paint size; }
 .tv-chart { height: 100%; }
 .chart-overlay {
   position: absolute;
@@ -211,7 +211,7 @@ body { margin: 0; background: #060b13; }
   font-variant-numeric: tabular-nums;
 }
 .tape-columns { color: #738eb9; border-bottom: 1px solid #1a263d; }
-.tape-scroll { overflow-y: auto; min-height: 0; }
+.tape-scroll { overflow-y: auto; min-height: 0; contain: strict; }
 .tape-row { border-bottom: 1px solid rgba(26, 38, 61, 0.45); }
 .tape-row.buy { background: rgba(21, 73, 52, .21); }
 .tape-row.sell { background: rgba(95, 35, 43, .22); }

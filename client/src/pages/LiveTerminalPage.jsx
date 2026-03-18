@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import { TopStatusBar } from '../components/TopStatusBar.jsx';
 import { TradeTape } from '../components/TradeTape.jsx';
@@ -19,6 +19,13 @@ function buildStatsSnapshot(windowTrades) {
     low: prices.length ? Math.min(...prices) : null,
     movePct: first && last ? ((last - first) / first) * 100 : null
   };
+}
+
+function areStatsEqual(prev, next) {
+  return prev.last === next.last
+    && prev.high === next.high
+    && prev.low === next.low
+    && prev.movePct === next.movePct;
 }
 
 export function LiveTerminalPage() {
@@ -47,7 +54,8 @@ export function LiveTerminalPage() {
       setTrades(visibleTrades);
 
       statsTradesRef.current = bootstrapTrades.slice(0, UI_LIMITS.statsWindowSize);
-      setStats(buildStatsSnapshot(statsTradesRef.current));
+      const nextStats = buildStatsSnapshot(statsTradesRef.current);
+      setStats((prev) => (areStatsEqual(prev, nextStats) ? prev : nextStats));
 
       setBook(payload.latestBook || null);
       setDepth(payload.depth || null);
@@ -83,16 +91,16 @@ export function LiveTerminalPage() {
     socket.on('bookTicker', onBookTicker);
     socket.on('depth', onDepth);
 
-    const tradesFlushTimer = setInterval(() => {
+    const tradesFlushTimer = window.setInterval(() => {
       const pendingTrades = pendingTradesRef.current;
-      if (pendingTrades.length) {
-        const newTrades = pendingTrades.slice().reverse();
-        pendingTradesRef.current = [];
-        setTrades((prev) => [...newTrades, ...prev].slice(0, UI_LIMITS.visibleTradeRows));
-      }
+      if (!pendingTrades.length) return;
+
+      const newTrades = pendingTrades.slice().reverse();
+      pendingTradesRef.current = [];
+      setTrades((prev) => [...newTrades, ...prev].slice(0, UI_LIMITS.visibleTradeRows));
     }, UI_REFRESH_INTERVALS_MS.tradeTape);
 
-    const bookFlushTimer = setInterval(() => {
+    const bookFlushTimer = window.setInterval(() => {
       if (bookDirtyRef.current) {
         setBook(pendingBookRef.current);
         bookDirtyRef.current = false;
@@ -103,8 +111,9 @@ export function LiveTerminalPage() {
       }
     }, UI_REFRESH_INTERVALS_MS.orderBook);
 
-    const statsFlushTimer = setInterval(() => {
-      setStats(buildStatsSnapshot(statsTradesRef.current));
+    const statsFlushTimer = window.setInterval(() => {
+      const nextStats = buildStatsSnapshot(statsTradesRef.current);
+      setStats((prev) => (areStatsEqual(prev, nextStats) ? prev : nextStats));
     }, UI_REFRESH_INTERVALS_MS.stats);
 
     const onFullscreenChange = () => {
@@ -120,22 +129,22 @@ export function LiveTerminalPage() {
       socket.off('trade', onTrade);
       socket.off('bookTicker', onBookTicker);
       socket.off('depth', onDepth);
-      clearInterval(tradesFlushTimer);
-      clearInterval(bookFlushTimer);
-      clearInterval(statsFlushTimer);
+      window.clearInterval(tradesFlushTimer);
+      window.clearInterval(bookFlushTimer);
+      window.clearInterval(statsFlushTimer);
       document.removeEventListener('fullscreenchange', onFullscreenChange);
     };
   }, []);
 
   const topBarSpread = useMemo(() => depth?.spread || (book ? book.ask_price - book.bid_price : null), [depth?.spread, book]);
 
-  const toggleFullscreen = async () => {
+  const toggleFullscreen = useCallback(async () => {
     if (!document.fullscreenElement) {
       await rootRef.current?.requestFullscreen?.();
     } else {
       await document.exitFullscreen?.();
     }
-  };
+  }, []);
 
   return (
     <main className="terminal-root" ref={rootRef}>
