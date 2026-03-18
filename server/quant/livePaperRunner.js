@@ -26,6 +26,8 @@ export class LivePaperRunner {
       runConfig
     });
 
+    const market = this.getMarketSnapshot();
+
     this.active = {
       strategyRef,
       strategyName: resolved.summary.name,
@@ -49,7 +51,7 @@ export class LivePaperRunner {
       lastSignalReason: 'Waiting for the next closed candle.',
       strategyStatus: 'Monitoring live flow',
       lastUpdatedAt: Date.now(),
-      chartCandles: []
+      chartCandles: market.analysis.candles.slice(-MAX_CANDLE_WINDOW)
     };
 
     this.#persist();
@@ -94,6 +96,14 @@ export class LivePaperRunner {
       this.active.lastSignalReason = 'Awaiting enough live candle history.';
       this.active.strategyStatus = 'Warming up';
       return;
+    }
+
+    if (
+      this.active.engineState.lastProcessedCandleTime == null
+      && !this.active.engineState.session.previousCandle
+      && closedCandles.length >= 2
+    ) {
+      this.active.engineState.session.previousCandle = closedCandles.at(-2);
     }
 
     const pendingCandles = this.active.engineState.lastProcessedCandleTime == null
@@ -292,7 +302,18 @@ function buildFlatPosition(market) {
 }
 
 function buildChartPayload({ market, active }) {
-  const candles = (active.chartCandles?.length ? active.chartCandles : market.analysis.candles.slice(-MAX_CANDLE_WINDOW)).slice(-MAX_CANDLE_WINDOW);
+  const mergedCandles = new Map();
+
+  (market.analysis.candles || []).slice(-MAX_CANDLE_WINDOW).forEach((candle) => {
+    mergedCandles.set(candle.time, candle);
+  });
+  (active.chartCandles || []).slice(-MAX_CANDLE_WINDOW).forEach((candle) => {
+    mergedCandles.set(candle.time, candle);
+  });
+
+  const candles = [...mergedCandles.values()]
+    .sort((a, b) => a.time - b.time)
+    .slice(-MAX_CANDLE_WINDOW);
   const markers = (active.engineState?.tradeLog || [])
     .slice(0, MAX_TRADE_LOG)
     .map((row) => ({
