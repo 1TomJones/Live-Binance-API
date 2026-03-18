@@ -97,7 +97,12 @@ body { margin: 0; background: #060b13; }
   font-variant-numeric: tabular-nums;
 }
 .book-columns { color: #728cb8; border-bottom: 1px solid #1a263d; }
-.book-scroll { overflow-y: auto; min-height: 0; contain: strict; }
+.book-scroll {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  contain: strict;
+}
 .book-row {
   position: relative;
   border-bottom: 1px solid rgba(26, 38, 61, 0.4);
@@ -211,7 +216,12 @@ body { margin: 0; background: #060b13; }
   font-variant-numeric: tabular-nums;
 }
 .tape-columns { color: #738eb9; border-bottom: 1px solid #1a263d; }
-.tape-scroll { overflow-y: auto; min-height: 0; contain: strict; }
+.tape-scroll {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  contain: strict;
+}
 .tape-row { border-bottom: 1px solid rgba(26, 38, 61, 0.45); }
 .tape-row.buy { background: rgba(21, 73, 52, .21); }
 .tape-row.sell { background: rgba(95, 35, 43, .22); }
