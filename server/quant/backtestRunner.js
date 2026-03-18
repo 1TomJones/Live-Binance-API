@@ -1,4 +1,4 @@
-import { enrichCandlesFromTrades } from './candleEnrichment.js';
+import { buildSessionReplay } from './sessionReplayBuilder.js';
 
 export class BacktestRunner {
   constructor({ executionEngine, loadTrades }) {
@@ -22,10 +22,13 @@ export class BacktestRunner {
         endMs: dayEndMs,
         limit: null
       });
-      const candles = enrichCandlesFromTrades(dayTrades, strategy.market.timeframe, runState.settings, {
+      const candles = buildSessionReplay({
+        timeframe: strategy.market.timeframe,
         sessionStartMs: dayStartMs,
-        nowMs: dayEndMs
-      });
+        nowMs: dayEndMs,
+        trades: dayTrades,
+        settings: runState.settings
+      }).engineCandles;
 
       const fillModel = this.executionEngine.createFillModel({
         syntheticSpreadBps: runState.settings.syntheticSpreadBps
