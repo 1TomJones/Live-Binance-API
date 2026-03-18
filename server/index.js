@@ -6,6 +6,12 @@ import { fileURLToPath } from 'url';
 import { Server } from 'socket.io';
 import { BinanceStreamService } from './binanceStream.js';
 import {
+  aggregateTradeBuckets,
+  buildCvdMinuteCandlesFromKlines,
+  buildTradeBucketMapFromKlines,
+  fetchMinuteKlinesRange
+} from './binanceHistoricalData.js';
+import {
   completeQuantBacktestJob,
   createQuantBacktestJob,
   failQuantBacktestJob,
@@ -42,19 +48,6 @@ import { buildReplayEnvironment } from './quant/replayEnvironment.js';
 
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'BTCUSDT';
-const BINANCE_REST_BASES = [
-  process.env.BINANCE_REST_URL,
-  'https://api.binance.com/api/v3',
-  'https://api1.binance.com/api/v3',
-  'https://data-api.binance.vision/api/v3'
-].filter(Boolean);
-
-class NonRetryableInitializationError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'NonRetryableInitializationError';
-  }
-}
 
 const app = express();
 const server = http.createServer(app);
@@ -77,6 +70,7 @@ function createSessionState(dayStartMs) {
     volumeProfile: new Map(),
     lastProcessedTradeId: null,
     pendingDerivedTrades: [],
+    aggressorMinuteBuckets: new Map(),
     hydration: {
       status: 'idle',
       source: null,
@@ -195,90 +189,17 @@ function applyTradeToDerivedState(trade) {
   cvdCandle.close = sessionState.cvdRunning;
   cvdCandle.hasTrades = true;
 
+  const aggressorBucket = sessionState.aggressorMinuteBuckets.get(minuteTimeSec) || { buy: 0, sell: 0 };
+  if (trade.side === 'buy') aggressorBucket.buy += quantity;
+  else aggressorBucket.sell += quantity;
+  sessionState.aggressorMinuteBuckets.set(minuteTimeSec, aggressorBucket);
+
   const profileBucket = Math.floor(Number(trade.price));
   sessionState.volumeProfile.set(profileBucket, (sessionState.volumeProfile.get(profileBucket) || 0) + quantity);
 
   sessionState.lastProcessedTradeId = trade.trade_id;
   sessionState.hydration.processedTradeCount += 1;
   return true;
-}
-
-async function fetchBinanceWithFallback(endpointPath, search, { timeoutMs = 10000, context = 'binance-request', baseUrls = BINANCE_REST_BASES } = {}) {
-  const params = Object.fromEntries(search.entries());
-  let lastFailure = null;
-
-  for (const baseUrl of baseUrls) {
-    const normalizedEndpointPath = endpointPath.startsWith('/') ? endpointPath.slice(1) : endpointPath;
-    const baseAlreadyTargetsEndpoint = baseUrl.endsWith(`/${normalizedEndpointPath}`);
-    const url = baseAlreadyTargetsEndpoint
-      ? `${baseUrl}?${search.toString()}`
-      : `${baseUrl}${endpointPath}?${search.toString()}`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const response = await fetch(url, { signal: controller.signal });
-      if (!response.ok) {
-        const responseBody = await response.text();
-        const failure = {
-          status: response.status,
-          url,
-          baseUrl,
-          endpointPath,
-          params,
-          responseBody
-        };
-
-        console.error(`[${context}] non-200 response from Binance`, failure);
-        lastFailure = failure;
-
-        if (response.status >= 400 && response.status < 500) {
-          const message = responseBody || `HTTP ${response.status}`;
-          throw new NonRetryableInitializationError(
-            `Binance ${endpointPath} request rejected (HTTP ${response.status}): ${message}`
-          );
-        }
-
-        continue;
-      }
-
-      const payload = await response.json();
-      return { payload, url, baseUrl };
-    } catch (error) {
-      if (error instanceof NonRetryableInitializationError) {
-        throw error;
-      }
-
-      lastFailure = {
-        url,
-        baseUrl,
-        endpointPath,
-        params,
-        error: error?.message || String(error)
-      };
-      console.error(`[${context}] request failed`, lastFailure);
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-
-  throw new Error(
-    `Unable to fetch ${endpointPath} from Binance endpoints: ${JSON.stringify(lastFailure)}`
-  );
-}
-
-function normalizeKline(row) {
-  return {
-    time: Math.floor(Number(row[0]) / 1000),
-    open: Number(row[1]),
-    high: Number(row[2]),
-    low: Number(row[3]),
-    close: Number(row[4]),
-    volume: Number(row[5]),
-    takerBuyBaseVolume: Number(row[9] || 0),
-    hasTrades: Number(row[8] || 0) > 0,
-    isPlaceholder: false
-  };
 }
 
 function mergeMinuteCandlesIntoSession(candles = []) {
@@ -302,35 +223,12 @@ function mergeMinuteCandlesIntoSession(candles = []) {
 }
 
 async function backfillCurrentSessionCandlesFromBinance(dayStartMs, nowMs) {
-  const collected = [];
-  const nowSec = Math.floor(nowMs / 1000) * 1000;
-  let cursor = dayStartMs;
-
-  while (cursor <= nowSec) {
-    const search = new URLSearchParams({
-      symbol: SYMBOL,
-      interval: '1m',
-      startTime: String(cursor),
-      endTime: String(nowSec),
-      limit: '1000'
-    });
-
-    const { payload: batch } = await fetchBinanceWithFallback('/klines', search, {
-      context: 'session/hydration/klines'
-    });
-    if (!batch.length) break;
-
-    const normalized = batch.map(normalizeKline);
-    collected.push(...normalized);
-
-    const lastOpenMs = Number(batch.at(-1)?.[0] || cursor);
-    const nextCursor = lastOpenMs + 60_000;
-    if (nextCursor <= cursor) break;
-    cursor = nextCursor;
-
-  }
-
-  return collected;
+  return fetchMinuteKlinesRange({
+    symbol: SYMBOL,
+    startMs: dayStartMs,
+    endMs: nowMs,
+    context: 'session/hydration/klines'
+  });
 }
 
 async function initializeCurrentSession() {
@@ -350,6 +248,10 @@ async function initializeCurrentSession() {
   console.info('Starting candle backfill', { dayStartIso: new Date(dayStartMs).toISOString() });
   const backfilledCandles = await backfillCurrentSessionCandlesFromBinance(dayStartMs, nowMs);
   const mergedCandleCount = mergeMinuteCandlesIntoSession(backfilledCandles);
+  sessionState.cvdMinuteCandles = buildCvdMinuteCandlesFromKlines(backfilledCandles);
+  sessionState.cvdMinuteIndex = new Map(sessionState.cvdMinuteCandles.map((candle, index) => [candle.time, index]));
+  sessionState.cvdRunning = sessionState.cvdMinuteCandles.at(-1)?.close || 0;
+  sessionState.aggressorMinuteBuckets = buildTradeBucketMapFromKlines(backfilledCandles, '1m');
   sessionState.volumeProfile = new Map(
     buildVolumeProfileFromCandles(backfilledCandles).map(({ price, volume }) => [price, volume])
   );
@@ -404,7 +306,7 @@ async function initializeCurrentSessionSafe() {
 
 function buildSessionPayload(timeframe = '1m') {
   const nowMs = Date.now();
-  const { replay, trades: sessionTrades, minuteCandles } = buildLiveReplayEnvironment({ timeframe, nowMs });
+  const { replay, trades: sessionTrades = [], minuteCandles = [] } = buildLiveReplayEnvironment({ timeframe, nowMs });
 
   const timeframeCounts = ['1m', '5m', '15m', '1h'].reduce((acc, tf) => {
     acc[tf] = aggregateCandles(minuteCandles, tf).length;
@@ -518,7 +420,41 @@ function buildStrategyCatalog() {
 
 const backtestRunner = new BacktestRunner({
   executionEngine,
-  loadTrades: ({ symbol, startMs, endMs, limit }) => getTradesByRange(symbol, startMs, endMs, limit)
+  loadMarketData: async ({ symbol, startMs, endMs, timeframe }) => {
+    try {
+      const minuteCandles = await fetchMinuteKlinesRange({
+        symbol,
+        startMs,
+        endMs,
+        context: 'backtest/klines'
+      });
+
+      return {
+        input: {
+          mode: 'canonical',
+          minuteCandles,
+          cvdMinuteCandles: buildCvdMinuteCandlesFromKlines(minuteCandles),
+          byBucket: buildTradeBucketMapFromKlines(minuteCandles, timeframe)
+        },
+        source: 'binance_klines'
+      };
+    } catch (error) {
+      console.warn('[backtest] falling back to stored trades after kline fetch failure', {
+        symbol,
+        startMs,
+        endMs,
+        error: error?.message || String(error)
+      });
+
+      return {
+        input: {
+          mode: 'trades',
+          trades: getTradesByRange(symbol, startMs, endMs, null)
+        },
+        source: 'stored_trades_fallback'
+      };
+    }
+  }
 });
 
 const backtestJobService = new BacktestJobService({
@@ -557,7 +493,6 @@ function buildLiveMarketSnapshot() {
 
 function buildLiveReplayEnvironment({ timeframe = '1m', replayMode = 'live', nowMs = Date.now() } = {}) {
   ensureCurrentSession(nowMs);
-  const trades = getTradesByRange(SYMBOL, sessionState.dayStartMs, nowMs, null);
 
   return buildReplayEnvironment({
     timeframe,
@@ -565,8 +500,10 @@ function buildLiveReplayEnvironment({ timeframe = '1m', replayMode = 'live', now
     sessionStartMs: sessionState.dayStartMs,
     nowMs,
     input: {
-      mode: 'trades',
-      trades
+      mode: 'canonical',
+      minuteCandles: sessionState.minuteCandles,
+      cvdMinuteCandles: sessionState.cvdMinuteCandles,
+      byBucket: aggregateTradeBuckets(sessionState.aggressorMinuteBuckets, timeframe)
     }
   });
 }

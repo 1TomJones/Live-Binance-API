@@ -39,7 +39,7 @@ export class BacktestJobService {
 
       this.updateJob(jobId, { status: 'running', progress_pct: 1, current_marker: 'Preparing historical replay', elapsed_ms: 0 });
 
-      const resultPayload = this.backtestRunner.run({
+      const resultPayload = await this.backtestRunner.run({
         strategy: resolved.strategy,
         runConfig: {
           ...runConfig,
