@@ -1,0 +1,146 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fixture from './__fixtures__/marketReplayParity.json' with { type: 'json' };
+import { getBuiltInStrategyDefinition } from './builtinStrategies.js';
+import { BacktestRunner } from './backtestRunner.js';
+import { buildSessionReplay } from './sessionReplayBuilder.js';
+import {
+  buildHistoricalClosedCandleReplay,
+  buildLiveClosedCandleReplay,
+  runClosedCandleReplay
+} from './replayOrchestrator.js';
+import { StrategyExecutionEngine } from './strategyExecutionEngine.js';
+
+test('historical replay seeds previous candle before the first evaluable candle', () => {
+  const state = new StrategyExecutionEngine().createRunState({
+    strategy: getBuiltInStrategyDefinition('VWAP_CVD_Live_Trend_01').strategy,
+    runConfig: {}
+  });
+  const closedCandles = [
+    { time: 100, close: 1, cvd_close: 1 },
+    { time: 160, close: 2, cvd_close: 2 },
+    { time: 220, close: 3, cvd_close: 3 }
+  ];
+
+  const replay = buildHistoricalClosedCandleReplay({ state, closedCandles });
+
+  assert.equal(state.session.previousCandle.time, 100);
+  assert.deepStrictEqual(replay.pendingCandles.map((candle) => candle.time), [160, 220]);
+});
+
+test('live replay evaluates only newly closed candles while preserving the prior closed candle as context', () => {
+  const state = new StrategyExecutionEngine().createRunState({
+    strategy: getBuiltInStrategyDefinition('VWAP_CVD_Live_Trend_01').strategy,
+    runConfig: {}
+  });
+  const closedCandles = [
+    { time: 100, close: 1, cvd_close: 1 },
+    { time: 160, close: 2, cvd_close: 2 },
+    { time: 220, close: 3, cvd_close: 3 }
+  ];
+
+  const replay = buildLiveClosedCandleReplay({ state, closedCandles });
+
+  assert.equal(state.session.previousCandle.time, 160);
+  assert.deepStrictEqual(replay.pendingCandles.map((candle) => candle.time), [220]);
+});
+
+test('backtest runner replays candles through the shared execution loop and emits entry debug output', () => {
+  const { trades, sessionStartMs, nowMs } = fixture;
+  const strategy = getBuiltInStrategyDefinition('VWAP_CVD_Live_Trend_01').strategy;
+  const expectedReplay = buildSessionReplay({
+    replayMode: 'backtest',
+    timeframe: strategy.market.timeframe,
+    sessionStartMs,
+    nowMs,
+    trades,
+    settings: {
+      stopLossPct: strategy.risk.stop_loss_pct,
+      takeProfitPct: strategy.risk.take_profit_pct
+    }
+  }).closedEngineCandles;
+  const runner = new BacktestRunner({
+    executionEngine: new StrategyExecutionEngine(),
+    loadTrades: ({ startMs, endMs }) => trades.filter((trade) => trade.trade_time >= startMs && trade.trade_time <= endMs)
+  });
+
+  const result = runner.run({
+    strategy,
+    runConfig: {
+      startDate: new Date(sessionStartMs).toISOString().slice(0, 10),
+      endDate: new Date(sessionStartMs).toISOString().slice(0, 10),
+      replaySpeed: 48
+    }
+  });
+
+  assert.equal(result.replaySpeed, 48);
+  assert.equal(result.candleDebugLog.length, Math.max(expectedReplay.length - 1, 0));
+  assert.deepStrictEqual(
+    result.candleDebugLog[0],
+    {
+      date: new Date(sessionStartMs).toISOString().slice(0, 10),
+      time: expectedReplay[1].time,
+      close: expectedReplay[1].close,
+      vwap_session: expectedReplay[1].vwap_session,
+      cvd_close: expectedReplay[1].cvd_close,
+      prev_cvd_close: expectedReplay[1].prev_cvd_close,
+      longSignal: expectedReplay[1].close > expectedReplay[1].vwap_session && expectedReplay[1].cvd_close > expectedReplay[1].prev_cvd_close,
+      shortSignal: expectedReplay[1].close < expectedReplay[1].vwap_session && expectedReplay[1].cvd_close < expectedReplay[1].prev_cvd_close
+    }
+  );
+});
+
+test('shared replay loop keeps end-of-day flattening in the common execution path', () => {
+  const strategy = getBuiltInStrategyDefinition('VWAP_CVD_Live_Trend_01').strategy;
+  const executionEngine = new StrategyExecutionEngine();
+  const state = executionEngine.createRunState({ strategy, runConfig: {} });
+  const fillModel = executionEngine.createFillModel({ syntheticSpreadBps: 0 });
+  const candles = [
+    {
+      time: 100,
+      open: 100,
+      high: 100,
+      low: 100,
+      close: 100,
+      volume: 1,
+      vwap_session: 99,
+      cvd_open: 0,
+      cvd_high: 1,
+      cvd_low: 0,
+      cvd_close: 1,
+      prev_cvd_close: 0,
+      stopLossPct: 0.35,
+      takeProfitPct: 0.7
+    },
+    {
+      time: 160,
+      open: 101,
+      high: 101,
+      low: 101,
+      close: 101,
+      volume: 1,
+      vwap_session: 100,
+      cvd_open: 1,
+      cvd_high: 2,
+      cvd_low: 1,
+      cvd_close: 2,
+      prev_cvd_close: 1,
+      stopLossPct: 0.35,
+      takeProfitPct: 0.7
+    }
+  ];
+  buildHistoricalClosedCandleReplay({ state, closedCandles: candles });
+
+  const endOfDayClose = runClosedCandleReplay({
+    strategy,
+    state,
+    candles: candles.slice(1),
+    executionEngine,
+    fillModel,
+    currentDateLabel: '2025-01-01',
+    finalizeSession: true
+  });
+
+  assert.equal(endOfDayClose?.exitReason, 'end_of_day_exit');
+  assert.equal(state.position, null);
+});

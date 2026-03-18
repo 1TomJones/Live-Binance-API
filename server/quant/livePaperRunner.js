@@ -1,4 +1,5 @@
 import { PAPER_EXECUTION_LIMITS, StrategyExecutionEngine } from './strategyExecutionEngine.js';
+import { buildLiveClosedCandleReplay, runClosedCandleReplay } from './replayOrchestrator.js';
 
 const MAX_CANDLE_WINDOW = 120;
 const MAX_TRADE_LOG = 200;
@@ -98,19 +99,15 @@ export class LivePaperRunner {
       return;
     }
 
-    if (
-      this.active.engineState.lastProcessedCandleTime == null
-      && !this.active.engineState.session.previousCandle
-      && closedCandles.length >= 2
-    ) {
-      this.active.engineState.session.previousCandle = closedCandles.at(-2);
-    }
-
-    const pendingCandles = this.active.engineState.lastProcessedCandleTime == null
-      ? closedCandles.slice(-1)
-      : closedCandles.filter((candle) => candle.time > this.active.engineState.lastProcessedCandleTime);
+    const { pendingCandles, seededPreviousCandle } = buildLiveClosedCandleReplay({
+      state: this.active.engineState,
+      closedCandles
+    });
 
     if (!pendingCandles.length) {
+      this.active.lastSignalReason = seededPreviousCandle
+        ? 'Seeded the prior closed candle and waiting for the next evaluation.'
+        : this.active.lastSignalReason;
       this.active.strategyStatus = this.active.status === 'running' ? 'Monitoring live flow' : 'Stopped';
       return;
     }
@@ -122,39 +119,35 @@ export class LivePaperRunner {
       })
     });
 
-    pendingCandles.forEach((candle) => {
-      const candleWithRisk = {
+    runClosedCandleReplay({
+      strategy: this.active.strategy,
+      state: this.active.engineState,
+      candles: pendingCandles.map((candle) => ({
         ...candle,
         stopLossPct: this.active.settings.stopLossPct,
         takeProfitPct: this.active.settings.takeProfitPct
-      };
-      const beforeTrades = this.active.engineState.trades.length;
-      const hadPosition = Boolean(this.active.engineState.position);
+      })),
+      executionEngine: this.executionEngine,
+      fillModel,
+      onCandle: ({ candle, before, state }) => {
+        this.active.chartCandles = [...this.active.chartCandles, candle].slice(-MAX_CANDLE_WINDOW);
 
-      this.executionEngine.processCandle({
-        strategy: this.active.strategy,
-        state: this.active.engineState,
-        candle: candleWithRisk,
-        fillModel,
-        currentDateLabel: new Date(candle.time * 1000).toISOString().slice(0, 10)
-      });
-
-      this.active.chartCandles = [...this.active.chartCandles, candleWithRisk].slice(-MAX_CANDLE_WINDOW);
-
-      if (!hadPosition && this.active.engineState.position) {
-        this.active.lastAction = this.active.engineState.position.side === 'long' ? 'BUY' : 'SELL';
-        this.active.lastSignalReason = this.active.engineState.position.entryReason;
-        this.active.strategyStatus = `Position opened · ${this.active.engineState.position.side}`;
-      } else if (this.active.engineState.trades.length > beforeTrades) {
-        const trade = this.active.engineState.trades.at(-1);
-        this.active.lastAction = 'EXIT';
-        this.active.lastSignalReason = formatExitReason(trade.exitReason);
-        this.active.strategyStatus = 'Flat · monitoring live flow';
-      } else {
-        this.active.lastAction = 'No Trade';
-        this.active.lastSignalReason = 'No entry trigger on the latest closed candle.';
-        this.active.strategyStatus = this.active.engineState.position ? 'Position active' : 'Monitoring live flow';
-      }
+        if (!before.hadPosition && state.position) {
+          this.active.lastAction = state.position.side === 'long' ? 'BUY' : 'SELL';
+          this.active.lastSignalReason = state.position.entryReason;
+          this.active.strategyStatus = `Position opened · ${state.position.side}`;
+        } else if (state.trades.length > before.tradeCount) {
+          const trade = state.trades.at(-1);
+          this.active.lastAction = 'EXIT';
+          this.active.lastSignalReason = formatExitReason(trade.exitReason);
+          this.active.strategyStatus = 'Flat · monitoring live flow';
+        } else {
+          this.active.lastAction = 'No Trade';
+          this.active.lastSignalReason = 'No entry trigger on the latest closed candle.';
+          this.active.strategyStatus = state.position ? 'Position active' : 'Monitoring live flow';
+        }
+      },
+      currentDateLabel: (candle) => new Date(candle.time * 1000).toISOString().slice(0, 10)
     });
   }
 

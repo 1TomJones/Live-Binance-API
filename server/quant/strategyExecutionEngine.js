@@ -56,6 +56,7 @@ export class StrategyExecutionEngine {
   processCandle({ strategy, state, candle, fillModel, currentDateLabel }) {
     const previousCandle = state.session.previousCandle || candle;
     const context = this.#buildContext(candle, previousCandle, state.position, strategy);
+    const entryEvaluation = this.evaluateEntrySignals({ strategy, state, context });
 
     if (state.position) {
       state.position.holdingBars += 1;
@@ -91,14 +92,11 @@ export class StrategyExecutionEngine {
     }
 
     if (!state.position && state.session.cooldownBars === 0) {
-      const longSignal = state.settings.enableLong && strategy.market.allow_long && this.ruleEvaluator.evaluateBlock(strategy.entryRules.long, context);
-      const shortSignal = state.settings.enableShort && strategy.market.allow_short && this.ruleEvaluator.evaluateBlock(strategy.entryRules.short, context);
-
-      if (longSignal) {
+      if (entryEvaluation.longSignal) {
         const entryPrice = fillModel.getEntryPrice({ side: 'long', candle });
         state.position = this.#openPosition({ side: 'long', candle, entryPrice, quantity: state.orderSize, signalReason: 'Long signal confirmed.' });
         state.tradeLog.unshift(buildTradeLogRow(state.position, 'BUY'));
-      } else if (shortSignal) {
+      } else if (entryEvaluation.shortSignal) {
         const entryPrice = fillModel.getEntryPrice({ side: 'short', candle });
         state.position = this.#openPosition({ side: 'short', candle, entryPrice, quantity: state.orderSize, signalReason: 'Short signal confirmed.' });
         state.tradeLog.unshift(buildTradeLogRow(state.position, 'SELL'));
@@ -115,7 +113,8 @@ export class StrategyExecutionEngine {
       drawdownPct,
       tradeCount: state.trades.length,
       openPosition: state.position,
-      lastProcessedCandleTime: state.lastProcessedCandleTime
+      lastProcessedCandleTime: state.lastProcessedCandleTime,
+      entryEvaluation
     };
   }
 
@@ -183,6 +182,21 @@ export class StrategyExecutionEngine {
         const quote = quoteResolver?.(candle) || buildSyntheticQuote(candle, syntheticSpreadBps);
         return side === 'long' ? quote.bid : quote.ask;
       }
+    };
+  }
+
+  evaluateEntrySignals({ strategy, state, context }) {
+    const values = context?.values || {};
+    const rawLongSignal = strategy.market.allow_long && this.ruleEvaluator.evaluateBlock(strategy.entryRules.long, context);
+    const rawShortSignal = strategy.market.allow_short && this.ruleEvaluator.evaluateBlock(strategy.entryRules.short, context);
+
+    return {
+      close: values.close,
+      vwap_session: values.vwap_session,
+      cvd_close: values.cvd_close,
+      prev_cvd_close: values.prev_cvd_close,
+      longSignal: Boolean(state.settings.enableLong && rawLongSignal),
+      shortSignal: Boolean(state.settings.enableShort && rawShortSignal)
     };
   }
 
@@ -318,24 +332,23 @@ function buildSyntheticQuote(candle, syntheticSpreadBps) {
 function buildTradeLogRow(trade, action) {
   return {
     id: `${action}-${trade.entryTime}-${trade.exitTime || trade.entryTime}`,
-    timestamp: action === 'EXIT' ? trade.exitTime : trade.entryTime,
     action,
     side: trade.side,
-    size: trade.quantity,
-    fillPrice: action === 'EXIT' ? trade.exitPrice : trade.entryPrice,
-    reason: action === 'EXIT' ? trade.exitReason : trade.entryReason,
-    resultingPosition: action === 'EXIT' ? 'Flat' : `${trade.side} ${trade.quantity.toFixed(4)}`,
-    realizedPnl: action === 'EXIT' ? trade.realizedPnl : null
+    price: action === 'EXIT' ? trade.exitPrice : trade.entryPrice,
+    time: action === 'EXIT' ? trade.exitTime : trade.entryTime,
+    realizedPnl: action === 'EXIT' ? trade.realizedPnl : 0,
+    reason: action === 'EXIT' ? trade.exitReason : trade.entryReason
   };
 }
 
 function normalizeOrderSize(value) {
   const numeric = Number(value || PAPER_EXECUTION_LIMITS.orderSizeMin);
-  const clamped = Math.min(PAPER_EXECUTION_LIMITS.orderSizeMax, Math.max(PAPER_EXECUTION_LIMITS.orderSizeMin, numeric));
-  const steps = Math.round(clamped / PAPER_EXECUTION_LIMITS.orderSizeStep);
-  return Number((steps * PAPER_EXECUTION_LIMITS.orderSizeStep).toFixed(4));
+  return Math.min(
+    PAPER_EXECUTION_LIMITS.orderSizeMax,
+    Math.max(PAPER_EXECUTION_LIMITS.orderSizeMin, round(numeric))
+  );
 }
 
 function round(value) {
-  return Number((value || 0).toFixed(6));
+  return Number(Number(value || 0).toFixed(8));
 }
