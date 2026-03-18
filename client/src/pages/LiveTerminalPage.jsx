@@ -4,7 +4,7 @@ import { TopStatusBar } from '../components/TopStatusBar.jsx';
 import { TradeTape } from '../components/TradeTape.jsx';
 import { OrderBookLadder } from '../components/OrderBookLadder.jsx';
 import { CandlestickChart } from '../components/CandlestickChart.jsx';
-import { UI_LIMITS, UI_REFRESH_INTERVALS_MS } from '../constants/uiPerformance.js';
+import { UI_LIMITS } from '../constants/uiPerformance.js';
 
 const socket = io();
 
@@ -41,10 +41,48 @@ export function LiveTerminalPage() {
   const statsTradesRef = useRef([]);
   const pendingBookRef = useRef(null);
   const pendingDepthRef = useRef(null);
+  const frameHandleRef = useRef(null);
+  const tradeDirtyRef = useRef(false);
   const bookDirtyRef = useRef(false);
   const depthDirtyRef = useRef(false);
+  const statsDirtyRef = useRef(false);
 
   useEffect(() => {
+    const flushUi = () => {
+      frameHandleRef.current = null;
+
+      if (tradeDirtyRef.current) {
+        const newTrades = pendingTradesRef.current.slice().reverse();
+        pendingTradesRef.current = [];
+        tradeDirtyRef.current = false;
+
+        if (newTrades.length) {
+          setTrades((prev) => [...newTrades, ...prev].slice(0, UI_LIMITS.visibleTradeRows));
+        }
+      }
+
+      if (bookDirtyRef.current) {
+        setBook(pendingBookRef.current);
+        bookDirtyRef.current = false;
+      }
+
+      if (depthDirtyRef.current) {
+        setDepth(pendingDepthRef.current);
+        depthDirtyRef.current = false;
+      }
+
+      if (statsDirtyRef.current) {
+        const nextStats = buildStatsSnapshot(statsTradesRef.current);
+        setStats((prev) => (areStatsEqual(prev, nextStats) ? prev : nextStats));
+        statsDirtyRef.current = false;
+      }
+    };
+
+    const scheduleUiFlush = () => {
+      if (frameHandleRef.current !== null) return;
+      frameHandleRef.current = window.requestAnimationFrame(flushUi);
+    };
+
     const onConnect = () => setConnected(true);
     const onDisconnect = () => setConnected(false);
 
@@ -59,10 +97,13 @@ export function LiveTerminalPage() {
 
       setBook(payload.latestBook || null);
       setDepth(payload.depth || null);
+      pendingTradesRef.current = [];
       pendingBookRef.current = payload.latestBook || null;
       pendingDepthRef.current = payload.depth || null;
+      tradeDirtyRef.current = false;
       bookDirtyRef.current = false;
       depthDirtyRef.current = false;
+      statsDirtyRef.current = false;
     };
 
     const onTrade = (trade) => {
@@ -72,16 +113,21 @@ export function LiveTerminalPage() {
       }
 
       statsTradesRef.current = [trade, ...statsTradesRef.current].slice(0, UI_LIMITS.statsWindowSize);
+      tradeDirtyRef.current = true;
+      statsDirtyRef.current = true;
+      scheduleUiFlush();
     };
 
     const onBookTicker = (nextBook) => {
       pendingBookRef.current = nextBook;
       bookDirtyRef.current = true;
+      scheduleUiFlush();
     };
 
     const onDepth = (nextDepth) => {
       pendingDepthRef.current = nextDepth;
       depthDirtyRef.current = true;
+      scheduleUiFlush();
     };
 
     socket.on('connect', onConnect);
@@ -90,31 +136,6 @@ export function LiveTerminalPage() {
     socket.on('trade', onTrade);
     socket.on('bookTicker', onBookTicker);
     socket.on('depth', onDepth);
-
-    const tradesFlushTimer = window.setInterval(() => {
-      const pendingTrades = pendingTradesRef.current;
-      if (!pendingTrades.length) return;
-
-      const newTrades = pendingTrades.slice().reverse();
-      pendingTradesRef.current = [];
-      setTrades((prev) => [...newTrades, ...prev].slice(0, UI_LIMITS.visibleTradeRows));
-    }, UI_REFRESH_INTERVALS_MS.tradeTape);
-
-    const bookFlushTimer = window.setInterval(() => {
-      if (bookDirtyRef.current) {
-        setBook(pendingBookRef.current);
-        bookDirtyRef.current = false;
-      }
-      if (depthDirtyRef.current) {
-        setDepth(pendingDepthRef.current);
-        depthDirtyRef.current = false;
-      }
-    }, UI_REFRESH_INTERVALS_MS.orderBook);
-
-    const statsFlushTimer = window.setInterval(() => {
-      const nextStats = buildStatsSnapshot(statsTradesRef.current);
-      setStats((prev) => (areStatsEqual(prev, nextStats) ? prev : nextStats));
-    }, UI_REFRESH_INTERVALS_MS.stats);
 
     const onFullscreenChange = () => {
       setIsFullscreen(Boolean(document.fullscreenElement));
@@ -129,9 +150,9 @@ export function LiveTerminalPage() {
       socket.off('trade', onTrade);
       socket.off('bookTicker', onBookTicker);
       socket.off('depth', onDepth);
-      window.clearInterval(tradesFlushTimer);
-      window.clearInterval(bookFlushTimer);
-      window.clearInterval(statsFlushTimer);
+      if (frameHandleRef.current !== null) {
+        window.cancelAnimationFrame(frameHandleRef.current);
+      }
       document.removeEventListener('fullscreenchange', onFullscreenChange);
     };
   }, []);
