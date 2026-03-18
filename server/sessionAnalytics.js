@@ -53,7 +53,10 @@ export function buildCanonicalMinuteCandles(
         low: price,
         close: price,
         volume,
-        hasTrades: true
+        hasTrades: true,
+        isPlaceholder: false,
+        isSynthetic: false,
+        state: 'hydrated'
       });
       return;
     }
@@ -84,7 +87,10 @@ export function buildCanonicalMinuteCandles(
         low: lastClose,
         close: lastClose,
         volume: 0,
-        hasTrades: false
+        hasTrades: false,
+        isPlaceholder: false,
+        isSynthetic: true,
+        state: 'synthetic'
       });
     } else {
       candles.push({
@@ -95,7 +101,9 @@ export function buildCanonicalMinuteCandles(
         close: null,
         volume: 0,
         hasTrades: false,
-        isPlaceholder: true
+        isPlaceholder: true,
+        isSynthetic: false,
+        state: 'placeholder'
       });
     }
   }
@@ -103,17 +111,31 @@ export function buildCanonicalMinuteCandles(
   return candles;
 }
 
-export function aggregateCandles(candles, timeframe = '1m') {
+export function aggregateCandles(candles, timeframe = '1m', { replayMode = 'scaffold' } = {}) {
   const hydratedOnly = candles.filter((candle) => Number.isFinite(candle.open) && Number.isFinite(candle.close));
+  const replayCandles = replayMode === 'market'
+    ? hydratedOnly.filter((candle) => Boolean(candle.hasTrades))
+    : hydratedOnly;
 
   if (timeframe === '1m') {
-    return hydratedOnly.map(({ time, open, high, low, close, volume, hasTrades }) => ({ time, open, high, low, close, volume, hasTrades }));
+    return replayCandles.map(({ time, open, high, low, close, volume, hasTrades, isPlaceholder, isSynthetic, state }) => ({
+      time,
+      open,
+      high,
+      low,
+      close,
+      volume,
+      hasTrades,
+      isPlaceholder: Boolean(isPlaceholder),
+      isSynthetic: Boolean(isSynthetic ?? !hasTrades),
+      state: state || (hasTrades ? 'hydrated' : 'synthetic')
+    }));
   }
 
   const tfSec = timeframeToSeconds(timeframe);
   const buckets = new Map();
 
-  hydratedOnly.forEach((candle) => {
+  replayCandles.forEach((candle) => {
     const bucket = bucketTime(candle.time, timeframe);
     const existing = buckets.get(bucket);
     if (!existing) {
@@ -124,7 +146,10 @@ export function aggregateCandles(candles, timeframe = '1m') {
         low: candle.low,
         close: candle.close,
         volume: Number(candle.volume || 0),
-        hasTrades: Boolean(candle.hasTrades)
+        hasTrades: Boolean(candle.hasTrades),
+        isPlaceholder: false,
+        isSynthetic: !Boolean(candle.hasTrades),
+        state: candle.hasTrades ? 'hydrated' : 'synthetic'
       });
       return;
     }
@@ -134,20 +159,29 @@ export function aggregateCandles(candles, timeframe = '1m') {
     existing.close = candle.close;
     existing.volume += Number(candle.volume || 0);
     existing.hasTrades = existing.hasTrades || Boolean(candle.hasTrades);
+    existing.isSynthetic = existing.isSynthetic && !Boolean(candle.hasTrades);
+    existing.state = existing.hasTrades ? 'hydrated' : 'synthetic';
   });
 
   const aggregated = [...buckets.values()].sort((a, b) => a.time - b.time);
-  for (let i = 1; i < aggregated.length; i += 1) {
-    if (!aggregated[i].hasTrades) {
-      const prevClose = aggregated[i - 1].close;
-      aggregated[i].open = prevClose;
-      aggregated[i].high = prevClose;
-      aggregated[i].low = prevClose;
-      aggregated[i].close = prevClose;
+  if (replayMode !== 'market') {
+    for (let i = 1; i < aggregated.length; i += 1) {
+      if (!aggregated[i].hasTrades) {
+        const prevClose = aggregated[i - 1].close;
+        aggregated[i].open = prevClose;
+        aggregated[i].high = prevClose;
+        aggregated[i].low = prevClose;
+        aggregated[i].close = prevClose;
+      }
     }
   }
 
-  return aggregated;
+  return aggregated.map((candle) => ({
+    ...candle,
+    isPlaceholder: false,
+    isSynthetic: !candle.hasTrades,
+    state: candle.hasTrades ? 'hydrated' : 'synthetic'
+  }));
 }
 
 export function buildCandlesFromTrades(trades, timeframe = '1m', options = {}) {

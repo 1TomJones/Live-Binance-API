@@ -23,12 +23,13 @@ export class BacktestRunner {
         limit: null
       });
       const candles = buildSessionReplay({
+        replayMode: 'backtest',
         timeframe: strategy.market.timeframe,
         sessionStartMs: dayStartMs,
         nowMs: dayEndMs,
         trades: dayTrades,
         settings: runState.settings
-      }).engineCandles;
+      }).closedEngineCandles;
 
       const fillModel = this.executionEngine.createFillModel({
         syntheticSpreadBps: runState.settings.syntheticSpreadBps
