@@ -28,7 +28,8 @@ import { BacktestJobService } from './quant/backtestJobService.js';
 import { StrategyParser } from './quant/strategyParser.js';
 import { StrategyExecutionEngine } from './quant/strategyExecutionEngine.js';
 import { BacktestRunner } from './quant/backtestRunner.js';
-import { createDefaultLivePaperRunner } from './quant/livePaperRunner.js';
+import { LivePaperRunner, LIVE_PAPER_LIMITS } from './quant/livePaperRunner.js';
+import { listBuiltInLiveStrategies } from './quant/builtinStrategies.js';
 import { StrategyUploadService, StrategyValidationService } from './quant/strategyServices.js';
 import {
   buildVolumeProfileFromCandles,
@@ -552,9 +553,43 @@ const backtestJobService = new BacktestJobService({
   getJobById: getQuantBacktestJobById
 });
 
-const liveStrategyRunner = createDefaultLivePaperRunner({
-  executionEngine,
-  loadTrades: ({ symbol, startMs, endMs, limit }) => getTradesByRange(symbol, startMs, endMs, limit),
+function buildLiveMarketSnapshot() {
+  const session = buildSessionPayload('1m');
+  const vwapByTime = new Map((session.vwap || []).map((point) => [point.time, point.value]));
+  const cvdByTime = new Map((session.cvd || []).map((point) => [point.time, point]));
+  const candles = (session.candles || [])
+    .filter((candle) => !candle.isPlaceholder && Number.isFinite(candle.open) && Number.isFinite(candle.close))
+    .map((candle, index, arr) => {
+      const cvdCandle = cvdByTime.get(candle.time) || {};
+      const previous = arr[index - 1] || candle;
+      const previousCvd = cvdByTime.get(previous.time) || cvdCandle;
+      return {
+        ...candle,
+        vwap: vwapByTime.get(candle.time) ?? candle.close,
+        cvd_close: cvdCandle.close ?? 0,
+        prev_cvd_close: previousCvd.close ?? cvdCandle.close ?? 0
+      };
+    });
+
+  const nowMinuteSec = Math.floor(Date.now() / 60000) * 60;
+  const closedCandles = candles.filter((candle) => candle.time < nowMinuteSec);
+  const markPrice = Number(latestTrade?.price || latestBook?.bidPrice || latestBook?.askPrice || candles.at(-1)?.close || 0) || null;
+
+  return {
+    symbol: SYMBOL,
+    bestBid: latestBook?.bidPrice ? Number(latestBook.bidPrice) : null,
+    bestAsk: latestBook?.askPrice ? Number(latestBook.askPrice) : null,
+    markPrice,
+    lastClose: candles.at(-1)?.close ? Number(candles.at(-1).close) : null,
+    analysis: {
+      candles,
+      closedCandles
+    }
+  };
+}
+
+const liveStrategyRunner = new LivePaperRunner({
+  getMarketSnapshot: buildLiveMarketSnapshot,
   saveLiveState: ({ strategyId, status, stateJson }) => saveQuantLiveRun({ strategyId, status, stateJson }),
   getLiveState: () => null
 });
@@ -659,17 +694,25 @@ app.get('/api/quant/runs', (_req, res) => {
 
 app.get('/api/quant/live-metrics', (_req, res) => {
   const snapshot = liveStrategyRunner.tick() || liveStrategyRunner.getSnapshot();
-  return res.json({ metrics: snapshot?.metrics || snapshot });
+  return res.json({ snapshot });
+});
+
+app.get('/api/quant/live/strategies', (_req, res) => {
+  return res.json({
+    strategies: listBuiltInLiveStrategies(),
+    limits: LIVE_PAPER_LIMITS
+  });
 });
 
 app.post('/api/quant/live/start', (req, res) => {
-  const { strategyId, runConfig } = req.body || {};
-  const strategyRecord = getQuantStrategyById(Number(strategyId));
-  if (!strategyRecord) return res.status(404).json({ error: 'Strategy not found' });
-  const parsed = strategyParser.parse(strategyRecord.raw_content);
-  if (!parsed.valid) return res.status(400).json({ error: parsed.errors.join(', ') });
-  const run = liveStrategyRunner.start({ strategyId: Number(strategyId), strategy: parsed.strategy, runConfig: runConfig || {} });
-  return res.json({ run });
+  try {
+    const { strategyKey, runConfig } = req.body || {};
+    if (!strategyKey) return res.status(400).json({ error: 'strategyKey is required.' });
+    const run = liveStrategyRunner.start({ strategyKey, runConfig: runConfig || {} });
+    return res.json({ run });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || 'Unable to start live paper strategy.' });
+  }
 });
 
 app.post('/api/quant/live/stop', (_req, res) => {
