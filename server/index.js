@@ -80,6 +80,7 @@ function createSessionState(dayStartMs) {
     cvdMinuteIndex: new Map(),
     volumeProfile: new Map(),
     lastProcessedTradeId: null,
+    pendingDerivedTrades: [],
     hydration: {
       status: 'idle',
       source: null,
@@ -127,6 +128,27 @@ function ensureCvdMinuteCandle(minuteTimeSec) {
 
 function getTradeCandleTimeSec(tradeTimeMs, candleIntervalSec = 60) {
   return Math.floor(Math.floor(Number(tradeTimeMs) / 1000) / candleIntervalSec) * candleIntervalSec;
+}
+
+function queuePendingDerivedTrade(trade) {
+  if (!trade) return;
+  sessionState.pendingDerivedTrades.push(trade);
+}
+
+function flushPendingDerivedTrades() {
+  if (!sessionState.pendingDerivedTrades.length) return 0;
+
+  const queuedTrades = [...sessionState.pendingDerivedTrades]
+    .sort((a, b) => a.trade_time - b.trade_time || a.trade_id - b.trade_id);
+
+  sessionState.pendingDerivedTrades = [];
+
+  let processed = 0;
+  queuedTrades.forEach((trade) => {
+    if (applyTradeToDerivedState(trade)) processed += 1;
+  });
+
+  return processed;
 }
 
 
@@ -431,6 +453,9 @@ async function initializeCurrentSession() {
     lastError: tradeBackfillError ? (tradeBackfillError?.message || String(tradeBackfillError)) : null
   };
 
+  const queuedTradeCount = sessionState.pendingDerivedTrades.length;
+  const flushedTradeCount = flushPendingDerivedTrades();
+
   console.info('[session/hydration] complete', {
     dayStartIso: new Date(dayStartMs).toISOString(),
     fetchedCandleCount: backfilledCandles.length,
@@ -438,6 +463,8 @@ async function initializeCurrentSession() {
     mergedCandleCount,
     processedTradeCount: tradeBackfill.processed,
     inMemoryMinuteCandleCount: sessionState.minuteCandles.length,
+    queuedTradeCount,
+    flushedTradeCount,
     tradeBackfillWarning: tradeBackfillError ? (tradeBackfillError?.message || String(tradeBackfillError)) : null
   });
 }
@@ -453,6 +480,12 @@ async function initializeCurrentSessionSafe() {
       finishedAt: Date.now(),
       lastError: error?.message || String(error)
     };
+    const queuedTradeCount = sessionState.pendingDerivedTrades.length;
+    const flushedTradeCount = flushPendingDerivedTrades();
+    console.warn('[session/hydration] flushed queued live trades after failure', {
+      queuedTradeCount,
+      flushedTradeCount
+    });
     console.error('Session initialization failed; continuing with live streams.', error);
   }
 }
@@ -547,7 +580,11 @@ const stream = new BinanceStreamService({
     ensureCurrentSession(trade.trade_time);
 
     applyTradeToMinuteCandle(trade);
-    applyTradeToDerivedState(trade);
+    if (sessionState.hydration.status === 'running') {
+      queuePendingDerivedTrade(trade);
+    } else {
+      applyTradeToDerivedState(trade);
+    }
 
     io.emit('trade', trade);
   },
