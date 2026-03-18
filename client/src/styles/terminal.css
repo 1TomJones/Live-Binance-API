@@ -227,8 +227,6 @@ body { margin: 0; background: #060b13; }
 .tape-row.sell { background: rgba(95, 35, 43, .22); }
 .side-tag { font-weight: 700; letter-spacing: .04em; }
 
-.replay-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid #1d2a42; font-size: 12px; background:#0a1220; }
-.replay-controls input, .replay-controls button { background: #0e1a2f; border: 1px solid #1d2a42; color: #d7e1f1; padding: 4px 6px; }
 .terminal-footer {
   height: 28px;
   border-top: 1px solid #1a263d;
