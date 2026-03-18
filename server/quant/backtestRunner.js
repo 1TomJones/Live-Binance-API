@@ -1,4 +1,5 @@
 import { buildSessionReplay } from './sessionReplayBuilder.js';
+import { buildHistoricalClosedCandleReplay, runClosedCandleReplay } from './replayOrchestrator.js';
 
 export class BacktestRunner {
   constructor({ executionEngine, loadTrades }) {
@@ -13,6 +14,7 @@ export class BacktestRunner {
     const totalDays = daysBetweenInclusive(startDate, endDate);
     const totalUnits = totalDays * 1000;
     const dayResults = [];
+    const candleDebugLog = [];
 
     forEachUtcDay(startDate, endDate, ({ dayStartMs, dayEndMs, isoDate, dayIndex }) => {
       shouldStop?.();
@@ -22,7 +24,7 @@ export class BacktestRunner {
         endMs: dayEndMs,
         limit: null
       });
-      const candles = buildSessionReplay({
+      const closedCandles = buildSessionReplay({
         replayMode: 'backtest',
         timeframe: strategy.market.timeframe,
         sessionStartMs: dayStartMs,
@@ -30,44 +32,67 @@ export class BacktestRunner {
         trades: dayTrades,
         settings: runState.settings
       }).closedEngineCandles;
+      const { pendingCandles } = buildHistoricalClosedCandleReplay({
+        state: runState,
+        closedCandles
+      });
 
       const fillModel = this.executionEngine.createFillModel({
         syntheticSpreadBps: runState.settings.syntheticSpreadBps
       });
 
-      candles.forEach((candle, candleIndex) => {
-        shouldStop?.();
-        this.executionEngine.processCandle({
-          strategy,
-          state: runState,
-          candle,
-          fillModel,
-          currentDateLabel: isoDate
-        });
-        const dayProgress = candles.length ? Math.floor(((candleIndex + 1) / candles.length) * 1000) : 1000;
+      const endOfDayClose = runClosedCandleReplay({
+        strategy,
+        state: runState,
+        candles: pendingCandles,
+        executionEngine: this.executionEngine,
+        fillModel,
+        currentDateLabel: isoDate,
+        finalizeSession: true,
+        onCandle: ({ candle, candleIndex, outcome, state }) => {
+          shouldStop?.();
+          candleDebugLog.push({
+            date: isoDate,
+            time: candle.time,
+            close: outcome.entryEvaluation.close,
+            vwap_session: outcome.entryEvaluation.vwap_session,
+            cvd_close: outcome.entryEvaluation.cvd_close,
+            prev_cvd_close: outcome.entryEvaluation.prev_cvd_close,
+            longSignal: outcome.entryEvaluation.longSignal,
+            shortSignal: outcome.entryEvaluation.shortSignal
+          });
+
+          const dayProgress = pendingCandles.length ? Math.floor(((candleIndex + 1) / pendingCandles.length) * 1000) : 1000;
+          progressCallback?.({
+            processed: dayIndex * 1000 + dayProgress,
+            total: totalUnits,
+            currentDate: isoDate,
+            totalTrades: state.trades.length,
+            elapsedMs: Date.now() - Date.parse(runConfig.startedAtIso || new Date().toISOString()),
+            marker: `Simulating ${isoDate} · candle ${candleIndex + 1}/${pendingCandles.length}`,
+            dayIndex: dayIndex + 1,
+            totalDays
+          });
+        }
+      });
+
+      if (!pendingCandles.length) {
         progressCallback?.({
-          processed: dayIndex * 1000 + dayProgress,
+          processed: (dayIndex + 1) * 1000,
           total: totalUnits,
           currentDate: isoDate,
           totalTrades: runState.trades.length,
           elapsedMs: Date.now() - Date.parse(runConfig.startedAtIso || new Date().toISOString()),
-          marker: `Simulating ${isoDate} · candle ${candleIndex + 1}/${candles.length}`,
+          marker: `Simulating ${isoDate} · warmup only`,
           dayIndex: dayIndex + 1,
           totalDays
         });
-      });
-
-      const endOfDayClose = this.executionEngine.finalizeDay({
-        strategy,
-        state: runState,
-        fillModel,
-        dateLabel: isoDate
-      });
+      }
 
       dayResults.push({
         date: isoDate,
         tradeCount: runState.trades.filter((trade) => trade.entryDate === isoDate).length,
-        candleCount: candles.length,
+        candleCount: pendingCandles.length,
         endOfDayExit: endOfDayClose ? endOfDayClose.exitReason : null
       });
     });
@@ -80,7 +105,9 @@ export class BacktestRunner {
 
     return {
       ...result,
-      dayResults
+      dayResults,
+      candleDebugLog,
+      replaySpeed: Number(runConfig.replaySpeed || 1)
     };
   }
 }

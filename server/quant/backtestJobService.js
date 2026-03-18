@@ -69,12 +69,14 @@ export class BacktestJobService {
           ...resultPayload.metrics,
           analyses: resultPayload.analyses,
           dayResults: resultPayload.dayResults,
+          replaySpeed: resultPayload.replaySpeed,
           strategy: resolved.summary
         }),
         equity_series_json: JSON.stringify({
           cumulativePnlSeries: resultPayload.cumulativePnlSeries,
           equitySeries: resultPayload.equitySeries,
-          drawdownSeries: resultPayload.drawdownSeries
+          drawdownSeries: resultPayload.drawdownSeries,
+          candleDebugLog: resultPayload.candleDebugLog
         }),
         trade_log_json: JSON.stringify(resultPayload.trades)
       });
