@@ -29,18 +29,16 @@ import { BacktestJobService } from './quant/backtestJobService.js';
 import { StrategyParser } from './quant/strategyParser.js';
 import { PAPER_EXECUTION_LIMITS, StrategyExecutionEngine } from './quant/strategyExecutionEngine.js';
 import { BacktestRunner } from './quant/backtestRunner.js';
-import { enrichMarketCandles } from './quant/candleEnrichment.js';
 import { LivePaperRunner, LIVE_PAPER_LIMITS } from './quant/livePaperRunner.js';
 import { getBuiltInStrategyDefinition, listBuiltInStrategyCatalog } from './quant/builtinStrategies.js';
 import { StrategyUploadService, StrategyValidationService } from './quant/strategyServices.js';
 import {
   buildVolumeProfileFromCandles,
   buildVolumeProfileFromMap,
-  computeSessionCvdFromMinuteCandles,
-  computeSessionVwapFromCandles,
   aggregateCandles,
   getUtcDayStartMs,
 } from './sessionAnalytics.js';
+import { buildSessionReplay } from './quant/sessionReplayBuilder.js';
 
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'BTCUSDT';
@@ -292,26 +290,6 @@ async function fetchBinanceWithFallback(endpointPath, search, { timeoutMs = 1000
   );
 }
 
-function buildTimeScaffold(timeframe, sessionStartMs, nowMs) {
-  const tfSeconds = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600 }[timeframe] || 60;
-  const startSec = Math.floor(sessionStartMs / 1000 / tfSeconds) * tfSeconds;
-  const endSec = Math.floor(nowMs / 1000 / tfSeconds) * tfSeconds;
-  const scaffold = [];
-  for (let ts = startSec; ts <= endSec; ts += tfSeconds) {
-    scaffold.push({
-      time: ts,
-      open: null,
-      high: null,
-      low: null,
-      close: null,
-      volume: 0,
-      hasTrades: false,
-      isPlaceholder: true
-    });
-  }
-  return scaffold;
-}
-
 function normalizeKline(row) {
   return {
     time: Math.floor(Number(row[0]) / 1000),
@@ -484,15 +462,12 @@ function buildSessionPayload(timeframe = '1m') {
   ensureCurrentSession();
   const nowMs = Date.now();
   const minuteCandles = [...sessionState.minuteCandles];
-  const hydratedCandles = aggregateCandles(minuteCandles, timeframe);
-  const scaffold = buildTimeScaffold(timeframe, sessionState.dayStartMs, nowMs);
-  const hydratedByTime = new Map(hydratedCandles.map((bar) => [bar.time, { ...bar, isPlaceholder: false, state: 'hydrated' }]));
-  const candles = scaffold.map((slot) => hydratedByTime.get(slot.time) || { ...slot, state: 'placeholder' });
-
-  const vwap = computeSessionVwapFromCandles(aggregateCandles(minuteCandles, timeframe));
-  const cvd = computeSessionCvdFromMinuteCandles(sessionState.cvdMinuteCandles, timeframe, {
+  const replay = buildSessionReplay({
+    timeframe,
     sessionStartMs: sessionState.dayStartMs,
-    nowMs
+    nowMs,
+    minuteCandles,
+    cvdMinuteCandles: sessionState.cvdMinuteCandles
   });
 
   const timeframeCounts = ['1m', '5m', '15m', '1h'].reduce((acc, tf) => {
@@ -500,31 +475,31 @@ function buildSessionPayload(timeframe = '1m') {
     return acc;
   }, {});
 
-  const placeholderCount = candles.filter((bar) => bar.isPlaceholder).length;
-  const hydratedCount = candles.length - placeholderCount;
-  const realOhlcVariance = new Set(hydratedCandles.map((bar) => `${bar.open}:${bar.high}:${bar.low}:${bar.close}`)).size;
+  const placeholderCount = replay.candles.filter((bar) => bar.isPlaceholder).length;
+  const hydratedCount = replay.candles.length - placeholderCount;
+  const realOhlcVariance = new Set(replay.hydratedCandles.map((bar) => `${bar.open}:${bar.high}:${bar.low}:${bar.close}`)).size;
 
   return {
     symbol: SYMBOL,
     timeframe,
     sessionStartMs: sessionState.dayStartMs,
     sessionStartIso: new Date(sessionState.dayStartMs).toISOString(),
-    candles,
-    vwap,
-    cvd,
+    candles: replay.candles,
+    vwap: replay.vwap,
+    cvd: replay.cvd,
     debug: {
       sessionTradeCount: sessionState.hydration.processedTradeCount,
-      sessionCandleCount: candles.length,
+      sessionCandleCount: replay.candles.length,
       hydratedCandleCount: hydratedCount,
       placeholderCandleCount: placeholderCount,
       realOhlcVariance,
       timeframeCounts,
       startsAtUtcMidnight: sessionState.dayStartMs === getUtcDayStartMs(nowMs),
       hydration: sessionState.hydration,
-      vwapCurrent: vwap.at(-1)?.value || null,
-      vwapHasVariance: new Set(vwap.map((point) => point.value.toFixed(8))).size > 1,
-      cvdCurrent: cvd.at(-1)?.close || null,
-      cvdBarsWithTrades: cvd.filter((bar) => bar.hasTrades).length
+      vwapCurrent: replay.vwap.at(-1)?.value || null,
+      vwapHasVariance: new Set(replay.vwap.map((point) => point.value.toFixed(8))).size > 1,
+      cvdCurrent: replay.cvd.at(-1)?.close || null,
+      cvdBarsWithTrades: replay.cvd.filter((bar) => bar.hasTrades).length
     }
   };
 }
@@ -622,14 +597,17 @@ const backtestJobService = new BacktestJobService({
 });
 
 function buildLiveMarketSnapshot() {
-  const session = buildSessionPayload('1m');
-  const vwapByTime = new Map((session.vwap || []).map((point) => [point.time, point.value]));
-  const cvdByTime = new Map((session.cvd || []).map((point) => [point.time, point]));
-  const rawCandles = (session.candles || [])
-    .filter((candle) => !candle.isPlaceholder && Number.isFinite(candle.open) && Number.isFinite(candle.close));
-  const candles = enrichMarketCandles(rawCandles, { vwapByTime, cvdByTime });
+  ensureCurrentSession();
+  const replay = buildSessionReplay({
+    timeframe: '1m',
+    sessionStartMs: sessionState.dayStartMs,
+    nowMs: Date.now(),
+    minuteCandles: sessionState.minuteCandles,
+    cvdMinuteCandles: sessionState.cvdMinuteCandles
+  });
 
   const nowMinuteSec = Math.floor(Date.now() / 60000) * 60;
+  const candles = replay.engineCandles;
   const closedCandles = candles.filter((candle) => candle.time < nowMinuteSec);
   const markPrice = Number(latestTrade?.price || latestBook?.bidPrice || latestBook?.askPrice || candles.at(-1)?.close || 0) || null;
 

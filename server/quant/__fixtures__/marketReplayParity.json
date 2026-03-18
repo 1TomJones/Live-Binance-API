@@ -1,0 +1,12 @@
+{
+  "sessionStartMs": 1767312000000,
+  "nowMs": 1767312299999,
+  "timeframe": "1m",
+  "trades": [
+    { "trade_id": 1, "price": 100, "quantity": 1.2, "trade_time": 1767312010000, "maker_flag": 0, "side": "buy" },
+    { "trade_id": 2, "price": 101, "quantity": 0.8, "trade_time": 1767312040000, "maker_flag": 1, "side": "sell" },
+    { "trade_id": 3, "price": 103, "quantity": 1.5, "trade_time": 1767312125000, "maker_flag": 0, "side": "buy" },
+    { "trade_id": 4, "price": 102, "quantity": 0.4, "trade_time": 1767312150000, "maker_flag": 1, "side": "sell" },
+    { "trade_id": 5, "price": 104, "quantity": 2.1, "trade_time": 1767312250000, "maker_flag": 0, "side": "buy" }
+  ]
+}
