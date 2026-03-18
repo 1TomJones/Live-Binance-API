@@ -7,6 +7,7 @@ import {
 
 export function buildSessionReplay({
   timeframe = '1m',
+  replayMode = 'live',
   sessionStartMs,
   nowMs = Date.now(),
   trades = [],
@@ -24,10 +25,11 @@ export function buildSessionReplay({
     })
   );
 
-  const hydratedCandles = aggregateCandles(resolvedMinuteCandles, timeframe);
+  const hydratedCandles = aggregateCandles(resolvedMinuteCandles, timeframe, { replayMode: 'market' });
+  const replayCandles = aggregateCandles(resolvedMinuteCandles, timeframe, { replayMode: 'scaffold' });
   const scaffold = buildTimeScaffold(timeframe, sessionStartMs, nowMs);
   const hydratedByTime = new Map(
-    hydratedCandles.map((candle) => [candle.time, { ...candle, isPlaceholder: false, state: 'hydrated' }])
+    replayCandles.map((candle) => [candle.time, { ...candle, isPlaceholder: false, state: candle.state || (candle.hasTrades ? 'hydrated' : 'synthetic') }])
   );
   const candles = scaffold.map((slot) => hydratedByTime.get(slot.time) || { ...slot, state: 'placeholder' });
 
@@ -39,18 +41,26 @@ export function buildSessionReplay({
   const resolvedBuckets = byBucket ?? buildTradeBucketMap(trades, timeframe, { sessionStartMs, nowMs });
   const vwapByTime = new Map(vwap.map((point) => [point.time, point.value]));
   const cvdByTime = new Map(cvd.map((point) => [point.time, point]));
-  const engineCandles = enrichReplayCandles(
-    candles.filter((candle) => !candle.isPlaceholder && Number.isFinite(candle.open) && Number.isFinite(candle.close)),
+  const closedEngineCandles = enrichReplayCandles(
+    hydratedCandles,
     { vwapByTime, cvdByTime, byBucket: resolvedBuckets, settings }
   );
+  const engineSourceCandles = replayMode === 'backtest'
+    ? hydratedCandles
+    : candles.filter((candle) => !candle.isPlaceholder && Number.isFinite(candle.open) && Number.isFinite(candle.close));
+  const engineCandles = replayMode === 'backtest'
+    ? closedEngineCandles
+    : enrichReplayCandles(engineSourceCandles, { vwapByTime, cvdByTime, byBucket: resolvedBuckets, settings });
 
   return {
     candles,
     hydratedCandles,
+    replayCandles,
     vwap,
     cvd,
     byBucket: resolvedBuckets,
-    engineCandles
+    engineCandles,
+    closedEngineCandles
   };
 }
 
@@ -69,7 +79,9 @@ export function buildTimeScaffold(timeframe, sessionStartMs, nowMs) {
       close: null,
       volume: 0,
       hasTrades: false,
-      isPlaceholder: true
+      isPlaceholder: true,
+      isSynthetic: false,
+      state: 'placeholder'
     });
   }
 
@@ -249,7 +261,9 @@ function normalizeMinuteCandles(candles = []) {
       close: Number(candle.close),
       volume: Number(candle.volume || 0),
       hasTrades: Boolean(candle.hasTrades),
-      isPlaceholder: Boolean(candle.isPlaceholder)
+      isPlaceholder: Boolean(candle.isPlaceholder),
+      isSynthetic: Boolean(candle.isSynthetic ?? (!candle.hasTrades && !candle.isPlaceholder)),
+      state: candle.state || (candle.isPlaceholder ? 'placeholder' : candle.hasTrades ? 'hydrated' : 'synthetic')
     }))
     .sort((a, b) => a.time - b.time);
 }
