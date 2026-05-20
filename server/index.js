@@ -45,6 +45,7 @@ import {
   getUtcDayStartMs,
 } from './sessionAnalytics.js';
 import { buildReplayEnvironment } from './quant/replayEnvironment.js';
+import { runTrainingPipeline, runFullBacktest } from './quant/demoEngine.js';
 
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'BTCUSDT';
@@ -729,6 +730,74 @@ app.get('/api/session/debug', (_req, res) => {
     vwapHasVariance: snapshot.debug.vwapHasVariance,
     cvdBarsWithTrades: snapshot.debug.cvdBarsWithTrades
   });
+});
+
+// ─── Demo ML Routes ──────────────────────────────────────────────────────────
+
+app.post('/api/demo/train', async (req, res) => {
+  // Allow long-running computation
+  req.socket.setTimeout(120000);
+  res.setTimeout(120000);
+
+  try {
+    const { symbol, interval, years, indicators: indicatorSelection } = req.body || {};
+    if (!symbol || !interval || !years) {
+      return res.status(400).json({ error: 'symbol, interval, and years are required.' });
+    }
+
+    const validSymbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'];
+    if (!validSymbols.includes(symbol)) {
+      return res.status(400).json({ error: `Invalid symbol. Must be one of: ${validSymbols.join(', ')}` });
+    }
+
+    const validIntervals = ['1h', '4h', '1d'];
+    if (!validIntervals.includes(interval)) {
+      return res.status(400).json({ error: `Invalid interval. Must be one of: ${validIntervals.join(', ')}` });
+    }
+
+    const numYears = Number(years);
+    if (![1, 2, 3, 5].includes(numYears)) {
+      return res.status(400).json({ error: 'years must be 1, 2, 3, or 5.' });
+    }
+
+    const result = await runTrainingPipeline({
+      symbol,
+      interval,
+      years: numYears,
+      indicatorSelection: indicatorSelection || {}
+    });
+
+    return res.json(result);
+  } catch (error) {
+    console.error('[api/demo/train] error', error);
+    return res.status(500).json({ error: error.message || 'Training pipeline failed.' });
+  }
+});
+
+app.post('/api/demo/backtest', async (req, res) => {
+  req.socket.setTimeout(120000);
+  res.setTimeout(120000);
+
+  try {
+    const { symbol, interval, years, modelId, trainedParams, indicators: indicatorSelection } = req.body || {};
+    if (!symbol || !interval || !years || !modelId || !trainedParams) {
+      return res.status(400).json({ error: 'symbol, interval, years, modelId, and trainedParams are required.' });
+    }
+
+    const result = await runFullBacktest({
+      symbol,
+      interval,
+      years: Number(years),
+      modelId,
+      trainedParams,
+      indicatorSelection: indicatorSelection || {}
+    });
+
+    return res.json(result);
+  } catch (error) {
+    console.error('[api/demo/backtest] error', error);
+    return res.status(500).json({ error: error.message || 'Backtest failed.' });
+  }
 });
 
 app.use('/api', (_req, res) => {
